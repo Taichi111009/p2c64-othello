@@ -29,6 +29,8 @@ from p2c64_bridge import (
 
 P2C_MAGIC = b"P2C64V20"
 P2C_FORMAT_VERSION = 2
+P2C_MAGIC_V3 = b"P2C64V30"
+P2C_FORMAT_VERSION_V3 = 3
 P2C_DEFAULT_SCALE = 128.0
 HEADER_STRUCT = struct.Struct("<8sIIfIIIIIIIQQ")
 assert HEADER_STRUCT.size == 64
@@ -36,6 +38,24 @@ assert HEADER_STRUCT.size == 64
 SCRELU_Q = 127
 SCRELU_BETA_MAX = 2047
 SCRELU_SHIFT = 7
+
+# WACA-G2 v3.0 fixed-point constants (MUST match include/p2c64_eval.hpp bit-for-bit!)
+WACA_EO_BLOCKS = 20
+WACA_F25 = 16
+WACA_F3 = 24
+WACA_MAX_HID = 24
+WACA_FEAT_CLAMP = 512
+WACA_S25_W_MAX = 16384
+WACA_S25_B_MAX = 1048576
+WACA_S25_SHIFT = 10
+WACA_MLP_W1_MAX = 127
+WACA_MLP_B1_MAX = 1048576
+WACA_MLP_S1 = 9
+WACA_MLP_W2_MAX = 4095
+WACA_MLP_B2_MAX = 1048576
+WACA_MLP_S2 = 10
+WACA_MAX_RES = 1024
+PLY_TO_EO_BLK = np.array([(p // 6) * 2 + (p & 1) for p in range(NUM_PLIES)], dtype=np.int32)
 
 BLOCK_ENTRY_DTYPE = np.dtype([("w", "<i2", (6,)), ("aux", "u1", (4,))], align=False)
 assert BLOCK_ENTRY_DTYPE.itemsize == 16
@@ -48,6 +68,7 @@ class EvalMode(IntEnum):
     CAND_B_PTM_3W3B_NAIVE = 3
     CAND_B_PTM_3W3B = 4
     CAND_C_PTM_HYBRID = 5
+    WACA_G2 = 6
 
 
 _DEFAULT_BRIDGE: Optional[P2C64Bridge] = None
@@ -102,6 +123,42 @@ def make_empty_p2c64(mode: EvalMode, score_scale: float = P2C_DEFAULT_SCALE) -> 
         macro_cw=np.zeros((NUM_PLIES, 512), dtype=np.int16),
         macro_ea=np.zeros((NUM_PLIES, 512), dtype=np.int16),
         macro_cd=np.zeros((NUM_PLIES, 512), dtype=np.int16),
+        score_scale=score_scale,
+        flags=1,
+    )
+
+
+@dataclass
+class WacaG2Model:
+    tier1_w: np.ndarray      # [60, 410022] int16
+    s25_w: np.ndarray        # [60, 16] int16
+    s25_b: np.ndarray        # [60] int32
+    h_emb: np.ndarray        # [20, 91854, 4] int8 (Even/Odd 20-block Key-14)
+    screlu_mu: np.ndarray    # [60, 3, 4] int16
+    screlu_beta: np.ndarray  # [60, 3, 4] int16
+    mlp_w1: np.ndarray       # [60, H, 24] int8
+    mlp_b1: np.ndarray       # [60, H] int32
+    mlp_w2: np.ndarray       # [60, H] int16
+    mlp_b2: np.ndarray       # [60] int32
+    mlp_hidden: int = 16
+    score_scale: float = P2C_DEFAULT_SCALE
+    flags: int = 1
+
+
+def make_empty_waca_g2(mlp_hidden: int = 16, score_scale: float = P2C_DEFAULT_SCALE) -> WacaG2Model:
+    h = int(np.clip(mlp_hidden, 1, WACA_MAX_HID))
+    return WacaG2Model(
+        tier1_w=np.zeros((NUM_PLIES, TOTAL_RAW_ENTRIES), dtype=np.int16),
+        s25_w=np.zeros((NUM_PLIES, WACA_F25), dtype=np.int16),
+        s25_b=np.zeros((NUM_PLIES,), dtype=np.int32),
+        h_emb=np.zeros((WACA_EO_BLOCKS, KEY_RAW_ENTRIES, 4), dtype=np.int8),
+        screlu_mu=np.full((NUM_PLIES, 3, 4), 16, dtype=np.int16),
+        screlu_beta=np.zeros((NUM_PLIES, 3, 4), dtype=np.int16),
+        mlp_w1=np.zeros((NUM_PLIES, h, WACA_F3), dtype=np.int8),
+        mlp_b1=np.zeros((NUM_PLIES, h), dtype=np.int32),
+        mlp_w2=np.zeros((NUM_PLIES, h), dtype=np.int16),
+        mlp_b2=np.zeros((NUM_PLIES,), dtype=np.int32),
+        mlp_hidden=h,
         score_scale=score_scale,
         flags=1,
     )
@@ -278,21 +335,115 @@ def save_p2c64(path: str | Path, model: P2C64Model) -> None:
         f.write(payload)
 
 
-def load_p2c(path: str | Path) -> RawNTupleModel | P2C64Model:
+def symmetrize_waca_g2_model(model: WacaG2Model, orbits: Dict[str, np.ndarray]) -> WacaG2Model:
+    """Enforce exact D4 internal mirror invariance & overflow-safe parameter bounds matching C++ WacaG2Weights::symmetrize."""
+    raw_rep = orbits["raw_orb_rep"]
+    k_rep = orbits["key_orb_rep"]
+    h = int(np.clip(model.mlp_hidden, 1, WACA_MAX_HID))
+
+    t1 = model.tier1_w[:, raw_rep].astype(np.int16, copy=True)
+    h_i8 = np.clip(model.h_emb.astype(np.int32), -127, 127).astype(np.int8)
+    h_sym = h_i8[:, k_rep, :].copy()
+
+    s25_w = np.clip(model.s25_w.astype(np.int32), -WACA_S25_W_MAX, WACA_S25_W_MAX).astype(np.int16)
+    s25_b = np.clip(model.s25_b.astype(np.int64), -WACA_S25_B_MAX, WACA_S25_B_MAX).astype(np.int32)
+    sc_mu = model.screlu_mu.astype(np.int16, copy=True)
+    sc_beta = np.clip(model.screlu_beta.astype(np.int32), -SCRELU_BETA_MAX, SCRELU_BETA_MAX).astype(np.int16)
+    w1 = np.clip(model.mlp_w1[:, :h, :].astype(np.int32), -WACA_MLP_W1_MAX, WACA_MLP_W1_MAX).astype(np.int8)
+    b1 = np.clip(model.mlp_b1[:, :h].astype(np.int64), -WACA_MLP_B1_MAX, WACA_MLP_B1_MAX).astype(np.int32)
+    w2 = np.clip(model.mlp_w2[:, :h].astype(np.int32), -WACA_MLP_W2_MAX, WACA_MLP_W2_MAX).astype(np.int16)
+    b2 = np.clip(model.mlp_b2.astype(np.int64), -WACA_MLP_B2_MAX, WACA_MLP_B2_MAX).astype(np.int32)
+
+    return WacaG2Model(
+        tier1_w=t1,
+        s25_w=s25_w,
+        s25_b=s25_b,
+        h_emb=h_sym,
+        screlu_mu=sc_mu,
+        screlu_beta=sc_beta,
+        mlp_w1=w1,
+        mlp_b1=b1,
+        mlp_w2=w2,
+        mlp_b2=b2,
+        mlp_hidden=h,
+        score_scale=model.score_scale,
+        flags=1,
+    )
+
+
+def save_waca_g2(path: str | Path, model: WacaG2Model) -> None:
+    h = int(np.clip(model.mlp_hidden, 1, WACA_MAX_HID))
+    t1 = np.ascontiguousarray(model.tier1_w, dtype="<i2")
+    s25_w = np.ascontiguousarray(model.s25_w, dtype="<i2")
+    s25_b = np.ascontiguousarray(model.s25_b, dtype="<i4")
+    h_emb = np.ascontiguousarray(model.h_emb, dtype="i1")
+    w1 = np.ascontiguousarray(model.mlp_w1[:, :h, :], dtype="i1")
+    b1 = np.ascontiguousarray(model.mlp_b1[:, :h], dtype="<i4")
+    w2 = np.ascontiguousarray(model.mlp_w2[:, :h], dtype="<i2")
+    b2 = np.ascontiguousarray(model.mlp_b2, dtype="<i4")
+
+    assert t1.shape == (NUM_PLIES, TOTAL_RAW_ENTRIES)
+    assert s25_w.shape == (NUM_PLIES, WACA_F25)
+    assert s25_b.shape == (NUM_PLIES,)
+    assert h_emb.shape == (WACA_EO_BLOCKS, KEY_RAW_ENTRIES, 4)
+    assert w1.shape == (NUM_PLIES, h, WACA_F3)
+    assert b1.shape == (NUM_PLIES, h)
+    assert w2.shape == (NUM_PLIES, h)
+    assert b2.shape == (NUM_PLIES,)
+
+    sc_chunks = []
+    for ply in range(NUM_PLIES):
+        sc_chunks.append(np.ascontiguousarray(model.screlu_mu[ply], dtype="<i2").tobytes())
+        sc_chunks.append(np.ascontiguousarray(model.screlu_beta[ply], dtype="<i2").tobytes())
+
+    payload = (
+        t1.tobytes()
+        + s25_w.tobytes()
+        + s25_b.tobytes()
+        + h_emb.tobytes()
+        + b"".join(sc_chunks)
+        + w1.tobytes()
+        + b1.tobytes()
+        + w2.tobytes()
+        + b2.tobytes()
+    )
+    chk = _fast_fnv1a_64(payload)
+    hdr = HEADER_STRUCT.pack(
+        P2C_MAGIC_V3,
+        P2C_FORMAT_VERSION_V3,
+        int(EvalMode.WACA_G2),
+        float(model.score_scale),
+        int(model.flags),
+        KEY_RAW_ENTRIES,
+        NONKEY_RAW_ENTRIES,
+        TOTAL_RAW_ENTRIES,
+        NUM_PLIES,
+        WACA_EO_BLOCKS,
+        h,
+        len(payload),
+        chk,
+    )
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(hdr)
+        f.write(payload)
+
+
+def load_p2c(path: str | Path) -> RawNTupleModel | P2C64Model | WacaG2Model:
     with open(path, "rb") as f:
         hdr_bytes = f.read(HEADER_STRUCT.size)
         if len(hdr_bytes) != HEADER_STRUCT.size:
             raise ValueError(f"Truncated .p2c header in {path}")
         (
             magic, version, mode_i, scale, flags,
-            kre, nre, tre, n_plies, n_blks, _res, payload_bytes, chk,
+            kre, nre, tre, n_plies, n_blks, res, payload_bytes, chk,
         ) = HEADER_STRUCT.unpack(hdr_bytes)
-        if magic != P2C_MAGIC or version != P2C_FORMAT_VERSION:
-            raise ValueError(f"Invalid .p2c v2.0 magic/version in {path} (got {magic!r}, v={version})")
-        if (kre, nre, tre, n_plies, n_blks) != (
-            KEY_RAW_ENTRIES, NONKEY_RAW_ENTRIES, TOTAL_RAW_ENTRIES, NUM_PLIES, NUM_BLOCKS
-        ):
-            raise ValueError("Table dimension mismatch in .p2c v2.0 header")
+        is_v2 = (magic == P2C_MAGIC and version == P2C_FORMAT_VERSION)
+        is_v3 = (magic == P2C_MAGIC_V3 and version == P2C_FORMAT_VERSION_V3)
+        if not (is_v2 or is_v3):
+            raise ValueError(f"Invalid .p2c magic/version in {path} (got {magic!r}, v={version})")
+        if (kre, nre, tre, n_plies) != (KEY_RAW_ENTRIES, NONKEY_RAW_ENTRIES, TOTAL_RAW_ENTRIES, NUM_PLIES):
+            raise ValueError("Table dimension mismatch in .p2c header")
         payload = f.read(payload_bytes)
         if len(payload) != payload_bytes:
             raise ValueError("Truncated .p2c payload")
@@ -308,6 +459,48 @@ def load_p2c(path: str | Path) -> RawNTupleModel | P2C64Model:
         chunk = mv[off : off + nbytes]
         off += nbytes
         return chunk
+
+    if is_v3:
+        if mode != EvalMode.WACA_G2 or n_blks != WACA_EO_BLOCKS:
+            raise ValueError(f"Invalid v3.0 header fields (mode={mode}, num_blocks={n_blks})")
+        h = int(res)
+        if h < 1 or h > WACA_MAX_HID:
+            raise ValueError(f"Invalid v3.0 mlp_hidden={h}")
+        t1 = np.frombuffer(take(NUM_PLIES * TOTAL_RAW_ENTRIES * 2), dtype="<i2").reshape(
+            NUM_PLIES, TOTAL_RAW_ENTRIES
+        ).copy()
+        s25_w = np.frombuffer(take(NUM_PLIES * WACA_F25 * 2), dtype="<i2").reshape(NUM_PLIES, WACA_F25).copy()
+        s25_b = np.frombuffer(take(NUM_PLIES * 4), dtype="<i4").reshape(NUM_PLIES).copy()
+        h_emb = np.frombuffer(take(WACA_EO_BLOCKS * KEY_RAW_ENTRIES * 4), dtype="i1").reshape(
+            WACA_EO_BLOCKS, KEY_RAW_ENTRIES, 4
+        ).copy()
+        sc_mu = np.zeros((NUM_PLIES, 3, 4), dtype=np.int16)
+        sc_beta = np.zeros((NUM_PLIES, 3, 4), dtype=np.int16)
+        for ply in range(NUM_PLIES):
+            sc_mu[ply] = np.frombuffer(take(24), dtype="<i2").reshape(3, 4)
+            sc_beta[ply] = np.frombuffer(take(24), dtype="<i2").reshape(3, 4)
+        w1 = np.frombuffer(take(NUM_PLIES * h * WACA_F3), dtype="i1").reshape(NUM_PLIES, h, WACA_F3).copy()
+        b1 = np.frombuffer(take(NUM_PLIES * h * 4), dtype="<i4").reshape(NUM_PLIES, h).copy()
+        w2 = np.frombuffer(take(NUM_PLIES * h * 2), dtype="<i2").reshape(NUM_PLIES, h).copy()
+        b2 = np.frombuffer(take(NUM_PLIES * 4), dtype="<i4").reshape(NUM_PLIES).copy()
+        return WacaG2Model(
+            tier1_w=t1,
+            s25_w=s25_w,
+            s25_b=s25_b,
+            h_emb=h_emb,
+            screlu_mu=sc_mu,
+            screlu_beta=sc_beta,
+            mlp_w1=w1,
+            mlp_b1=b1,
+            mlp_w2=w2,
+            mlp_b2=b2,
+            mlp_hidden=h,
+            score_scale=scale,
+            flags=flags,
+        )
+
+    if n_blks != NUM_BLOCKS:
+        raise ValueError(f"Table block count mismatch in .p2c v2.0 header (got {n_blks})")
 
     if mode == EvalMode.RAW_NTUPLE_64:
         w = np.frombuffer(take(NUM_PLIES * TOTAL_RAW_ENTRIES * 2), dtype="<i2").reshape(
@@ -460,3 +653,67 @@ def eval_p2c64_int_batch(
     ug = np.clip(h.sum(axis=1, dtype=np.int32) + mu_p[:, 2], 0, SCRELU_Q)
     res_acc += (beta_p[:, 2] * (ug * ug)).sum(axis=1, dtype=np.int32)
     return (total + a_lut + _sym_rshift_i32(res_acc, SCRELU_SHIFT)).astype(np.int32)
+
+
+def eval_waca_g2_int_batch(
+    model: WacaG2Model,
+    v1: np.ndarray,       # [N] int32
+    f25: np.ndarray,      # [N, 16] int32
+    f3_geom: np.ndarray,  # [N, 4] int32
+    key_ptm: np.ndarray,  # [N, 14] int32
+    ply: np.ndarray,      # [N] uint8
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Bit-exact Python integer simulator matching C++ eval_waca_g2_stages across all 3 stages."""
+    ply_i = ply.astype(np.int32)
+    n = len(ply_i)
+    v1_i = v1.astype(np.int32)
+    f25_i = f25.astype(np.int32)
+    f3g_i = f3_geom.astype(np.int32)
+
+    # Stage 2.5
+    acc25 = model.s25_b[ply_i].astype(np.int32) + (
+        model.s25_w[ply_i].astype(np.int32) * f25_i
+    ).sum(axis=1, dtype=np.int32)
+    r25 = np.clip(_sym_rshift_i32(acc25, WACA_S25_SHIFT), -WACA_MAX_RES, WACA_MAX_RES).astype(np.int32)
+    v25 = (v1_i + r25).astype(np.int32)
+
+    # Stage 3 Part 1: 20-block EO Key-14 4ch SCReLU
+    eo_blk = PLY_TO_EO_BLK[ply_i]
+    h = model.h_emb[eo_blk[:, None], key_ptm].astype(np.int32)  # [N, 14, 4]
+    mu_p = model.screlu_mu[ply_i].astype(np.int32)              # [N, 3, 4]
+    beta_p = model.screlu_beta[ply_i].astype(np.int32)          # [N, 3, 4]
+
+    s0 = np.zeros((n, 4), dtype=np.int32)
+    for r in range(4):
+        c1 = (r + 1) & 3
+        u = np.clip(h[:, 4 + r] + h[:, 8 + r] + h[:, r] + h[:, c1] + mu_p[:, 0], 0, SCRELU_Q)
+        s0 += u * u
+
+    s1 = np.zeros((n, 4), dtype=np.int32)
+    for d in range(2):
+        u = np.clip(h[:, 12 + d] + h[:, d] + h[:, d + 2] + mu_p[:, 1], 0, SCRELU_Q)
+        s1 += u * u
+
+    ug = np.clip(h.sum(axis=1, dtype=np.int32) + mu_p[:, 2], 0, SCRELU_Q)
+    s2 = (ug * ug).astype(np.int32)
+
+    sc_acc = (beta_p[:, 0] * s0 + beta_p[:, 1] * s1 + beta_p[:, 2] * s2).sum(axis=1, dtype=np.int32)
+    r_key = _sym_rshift_i32(sc_acc, SCRELU_SHIFT)
+    f_key = np.clip((s0 + s1 + s2) >> np.int32(8), -WACA_FEAT_CLAMP, WACA_FEAT_CLAMP).astype(np.int32)
+
+    # Stage 3 Part 2: 60-ply Pure-Integer SCReLU MLP (24 -> H -> 1)
+    H = int(model.mlp_hidden)
+    f_all = np.concatenate([f25_i, f3g_i, f_key], axis=1)  # [N, 24]
+    w1_p = model.mlp_w1[ply_i, :H, :].astype(np.int32)     # [N, H, 24]
+    b1_p = model.mlp_b1[ply_i, :H].astype(np.int32)        # [N, H]
+    z = b1_p + (w1_p * f_all[:, None, :]).sum(axis=2, dtype=np.int32)
+    u_mlp = np.where(
+        z <= 0, np.int32(0), np.minimum(z >> np.int32(WACA_MLP_S1), np.int32(SCRELU_Q))
+    ).astype(np.int32)
+    w2_p = model.mlp_w2[ply_i, :H].astype(np.int32)
+    acc2 = model.mlp_b2[ply_i].astype(np.int32) + (w2_p * (u_mlp * u_mlp)).sum(axis=1, dtype=np.int32)
+    r_mlp = _sym_rshift_i32(acc2, WACA_MLP_S2)
+
+    rt = np.clip(r25 + r_mlp + r_key, -WACA_MAX_RES, WACA_MAX_RES).astype(np.int32)
+    v3 = (v1_i + rt).astype(np.int32)
+    return v1_i, v25, v3

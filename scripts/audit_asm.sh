@@ -28,9 +28,14 @@ targets = [
     ("CAND_B_KEY14 [W]",      r"<int p2c64::evaluate_p2c64_ptm<\(p2c64::EvalMode\)4, true>\([^>]*>:\n(.*?)(?:\n\n|\Z)",  0),
     ("CAND_C_HYBRID [B]",     r"<int p2c64::evaluate_p2c64_ptm<\(p2c64::EvalMode\)5, false>\([^>]*>:\n(.*?)(?:\n\n|\Z)", 22),
     ("CAND_C_HYBRID [W]",     r"<int p2c64::evaluate_p2c64_ptm<\(p2c64::EvalMode\)5, true>\([^>]*>:\n(.*?)(?:\n\n|\Z)",  22),
+    ("WACA_G2 Stage1 [B]",    r"<int p2c64::eval_waca_stage1_ptm<false>\([^>]*>:\n(.*?)(?:\n\n|\Z)", 0),
+    ("WACA_G2 Stage1 [W]",    r"<int p2c64::eval_waca_stage1_ptm<true>\([^>]*>:\n(.*?)(?:\n\n|\Z)",  0),
+    ("WACA_G2 Stage2.5",      r"<(?:int )?p2c64::eval_waca_stage25_kernel\([^>]*>:\n(.*?)(?:\n\n|\Z)", 36),
+    ("WACA_G2 Stage3 [B]",    r"<int p2c64::eval_waca_stage3_ptm<false>\([^>]*>:\n(.*?)(?:\n\n|\Z)", 128),
+    ("WACA_G2 Stage3 [W]",    r"<int p2c64::eval_waca_stage3_ptm<true>\([^>]*>:\n(.*?)(?:\n\n|\Z)",  128),
 ]
 
-print("=== P2C-64 v2.0 Pure-Scalar Assembly Audit (objdump -d -C, Black [B] & White [W]) ===")
+print("=== P2C-64 v3.0 Pure-Scalar Assembly Audit (objdump -d -C, Black [B] & White [W]) ===")
 print(f"{'Kernel':<22} | {'Insns':>6} | {'imul':>5} | {'div':>4} | {'xmm/ymm/zmm':>11} | Status")
 print("-" * 74)
 
@@ -60,5 +65,5 @@ for name, pattern, max_imul in targets:
 
 if failed:
     sys.exit(1)
-print("\n[PASS] Assembly audit verified: 0 SIMD/AVX across all 12 PTM kernels; 0 imul in RAW/LINEAR/CAND_B; <=40 imul in CAND_A; <=20 imul in CAND_C.")
+print("\n[PASS] Assembly audit verified: 0 SIMD/AVX across all 17 v2.0 + v3.0 WACA-G2 kernels!")
 PYEOF

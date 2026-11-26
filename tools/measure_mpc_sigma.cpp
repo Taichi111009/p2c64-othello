@@ -58,25 +58,33 @@ static void print_usage(const char* prog) {
     std::printf("  --shallow <d>    Shallow search depth (default: 2)\n");
     std::printf("  --deep <d>       Deep search depth (default: 6)\n");
     std::printf("  --tt-mb <MB>     TT size in MiB (default: 64)\n");
+    std::printf("  --m25 <discs>    WACA-G2 m25 gate margin (default: 2.5)\n");
+    std::printf("  --m3 <discs>     WACA-G2 m3 gate margin (default: 1.5)\n");
+    std::printf("  --gate-mode <m>  safe_bnd|fail_hard|full (default: safe_bnd)\n");
     std::printf("  --csv <path>     Write MPC sigma comparison CSV\n");
 }
 
 int main(int argc, char** argv) {
-    std::string data_path, csv_path;
+    std::string data_path, csv_path, gate_mode_str = "safe_bnd";
     std::vector<std::string> model_paths;
     size_t num_pos = 2000;
     int d_shallow  = 2;
     int d_deep     = 6;
     size_t tt_mb   = 64;
+    double m25_d   = 2.5;
+    double m3_d    = 1.5;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--data" && i + 1 < argc)        data_path = argv[++i];
-        else if (arg == "--num-pos" && i + 1 < argc) num_pos = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
-        else if (arg == "--shallow" && i + 1 < argc) d_shallow = std::atoi(argv[++i]);
-        else if (arg == "--deep" && i + 1 < argc)    d_deep = std::atoi(argv[++i]);
-        else if (arg == "--tt-mb" && i + 1 < argc)   tt_mb = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
-        else if (arg == "--csv" && i + 1 < argc)     csv_path = argv[++i];
+        if (arg == "--data" && i + 1 < argc)           data_path = argv[++i];
+        else if (arg == "--num-pos" && i + 1 < argc)   num_pos = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
+        else if (arg == "--shallow" && i + 1 < argc)   d_shallow = std::atoi(argv[++i]);
+        else if (arg == "--deep" && i + 1 < argc)      d_deep = std::atoi(argv[++i]);
+        else if (arg == "--tt-mb" && i + 1 < argc)     tt_mb = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
+        else if (arg == "--m25" && i + 1 < argc)       m25_d = std::atof(argv[++i]);
+        else if (arg == "--m3" && i + 1 < argc)        m3_d = std::atof(argv[++i]);
+        else if (arg == "--gate-mode" && i + 1 < argc) gate_mode_str = argv[++i];
+        else if (arg == "--csv" && i + 1 < argc)       csv_path = argv[++i];
         else if (arg == "--models") {
             while (i + 1 < argc && argv[i + 1][0] != '-') {
                 model_paths.emplace_back(argv[++i]);
@@ -91,6 +99,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    GateMode gm = GateMode::SAFE_BND;
+    if (gate_mode_str == "fail_hard") gm = GateMode::FAIL_HARD;
+    else if (gate_mode_str == "full") gm = GateMode::FULL;
+
     std::ifstream ifs(data_path, std::ios::binary | std::ios::ate);
     if (!ifs) { std::fprintf(stderr, "ERROR: Cannot open '%s'\n", data_path.c_str()); return 1; }
     size_t file_bytes = static_cast<size_t>(ifs.tellg());
@@ -100,7 +112,6 @@ int main(int argc, char** argv) {
     std::vector<PackedSample> all(total_rec);
     ifs.read(reinterpret_cast<char*>(all.data()), static_cast<std::streamsize>(total_rec * sizeof(PackedSample)));
 
-    // Deterministically stride-sample across dataset to cover all ply buckets cleanly
     std::vector<PackedSample> samples;
     samples.reserve(std::min(num_pos, total_rec));
     if (total_rec <= num_pos) {
@@ -115,17 +126,34 @@ int main(int argc, char** argv) {
 
     std::printf("=== P2C-64 Multi-ProbCut (MPC) Sigma Measurer (depth %d -> %d) ===\n", d_shallow, d_deep);
     std::printf("Dataset : %s (%zu sampled positions out of %zu)\n\n", data_path.c_str(), samples.size(), total_rec);
-    std::printf("%-24s | %8s | %8s | %8s | %8s | %6s | %6s\n",
-                "Model", "All sig", "0-19", "20-39", "40-59", "Slope", "R^2");
-    std::printf("-------------------------+----------+----------+----------+----------+--------+-------\n");
+    std::printf("%-28s | %8s | %8s | %8s | %8s | %6s | %6s | %6s\n",
+                "Model / Pair", "All sig", "0-19", "20-39", "40-59", "Slope", "Bias", "R^2");
+    std::printf("-----------------------------+----------+----------+----------+----------+--------+--------+-------\n");
 
     std::ofstream csv_ofs;
     if (!csv_path.empty()) {
         csv_ofs.open(csv_path, std::ios::trunc);
         if (csv_ofs) {
-            csv_ofs << "model_path,mode,shallow,deep,n_pos,sigma_all,sigma_0_19,sigma_20_39,sigma_40_59,slope,r2\n";
+            csv_ofs << "model_path,mode,shallow,deep,n_pos,sigma_all,sigma_0_19,sigma_20_39,sigma_40_59,slope,intercept,r2\n";
         }
     }
+
+    auto emit_row = [&](const std::string& mp, const std::string& label,
+                        const std::vector<double>& ax, const std::vector<double>& ay,
+                        const std::vector<double> bx[3], const std::vector<double> by[3]) {
+        RegStats r_all = fit_linear_regression(ax, ay);
+        RegStats r_b0  = fit_linear_regression(bx[0], by[0]);
+        RegStats r_b1  = fit_linear_regression(bx[1], by[1]);
+        RegStats r_b2  = fit_linear_regression(bx[2], by[2]);
+        std::printf("%-28s | %8.3f | %8.3f | %8.3f | %8.3f | %6.3f | %+6.3f | %6.3f\n",
+                    label.c_str(), r_all.sigma, r_b0.sigma, r_b1.sigma, r_b2.sigma,
+                    r_all.slope, r_all.intercept, r_all.r2);
+        if (csv_ofs) {
+            csv_ofs << mp << "," << label << "," << d_shallow << "," << d_deep << ","
+                    << r_all.n << "," << r_all.sigma << "," << r_b0.sigma << "," << r_b1.sigma << ","
+                    << r_b2.sigma << "," << r_all.slope << "," << r_all.intercept << "," << r_all.r2 << "\n";
+        }
+    };
 
     for (const auto& mp : model_paths) {
         LoadedModel m;
@@ -134,44 +162,42 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "ERROR loading '%s': %s\n", mp.c_str(), err.c_str());
             return 1;
         }
-        // Disable exact endgame override during MPC measurement so pure depth d_shallow vs d_deep is measured
         PVSEngine eng(&m, tt_mb, 0);
+        eng.set_waca_gate(gm, m25_d, m3_d);
         const double inv_scale = 1.0 / static_cast<double>(m.score_scale);
 
-        std::vector<double> ax, ay;
-        std::vector<double> bx[3], by[3];
+        std::vector<double> ax, ay, ax_v1;
+        std::vector<double> bx[3], by[3], bx_v1[3];
         ax.reserve(samples.size()); ay.reserve(samples.size());
+        if (m.is_waca) ax_v1.reserve(samples.size());
 
         for (const auto& s : samples) {
             if (s.ply > 59) continue;
-            // Ensure position is not already terminal and has enough empties for deep search
             int empties = 60 - static_cast<int>(s.ply);
             if (empties <= d_deep) continue;
 
             eng.clear_tt();
-            double vs = static_cast<double>(eng.eval_fixed_depth(s.black, s.white, s.stm, d_shallow)) * inv_scale;
+            double vs = static_cast<double>(eng.eval_fixed_depth(s.black, s.white, s.stm, d_shallow, false)) * inv_scale;
             eng.clear_tt();
-            double vd = static_cast<double>(eng.eval_fixed_depth(s.black, s.white, s.stm, d_deep)) * inv_scale;
+            double vd = static_cast<double>(eng.eval_fixed_depth(s.black, s.white, s.stm, d_deep, false)) * inv_scale;
 
+            int bkt = (s.ply < 20) ? 0 : ((s.ply < 40) ? 1 : 2);
             ax.push_back(vs);
             ay.push_back(vd);
-            int bkt = (s.ply < 20) ? 0 : ((s.ply < 40) ? 1 : 2);
             bx[bkt].push_back(vs);
             by[bkt].push_back(vd);
+
+            if (m.is_waca) {
+                eng.clear_tt();
+                double vs_v1 = static_cast<double>(eng.eval_fixed_depth(s.black, s.white, s.stm, d_shallow, true)) * inv_scale;
+                ax_v1.push_back(vs_v1);
+                bx_v1[bkt].push_back(vs_v1);
+            }
         }
 
-        RegStats r_all = fit_linear_regression(ax, ay);
-        RegStats r_b0  = fit_linear_regression(bx[0], by[0]);
-        RegStats r_b1  = fit_linear_regression(bx[1], by[1]);
-        RegStats r_b2  = fit_linear_regression(bx[2], by[2]);
-
-        std::printf("%-24s | %8.3f | %8.3f | %8.3f | %8.3f | %6.3f | %6.3f\n",
-                    eval_mode_name(m.mode), r_all.sigma, r_b0.sigma, r_b1.sigma, r_b2.sigma, r_all.slope, r_all.r2);
-
-        if (csv_ofs) {
-            csv_ofs << mp << "," << eval_mode_name(m.mode) << "," << d_shallow << "," << d_deep << ","
-                    << r_all.n << "," << r_all.sigma << "," << r_b0.sigma << "," << r_b1.sigma << ","
-                    << r_b2.sigma << "," << r_all.slope << "," << r_all.r2 << "\n";
+        emit_row(mp, eval_mode_name(m.mode), ax, ay, bx, by);
+        if (m.is_waca) {
+            emit_row(mp, "WACA_G2[MPC-PureV64:V1->G2]", ax_v1, ay, bx_v1, by);
         }
     }
     return 0;

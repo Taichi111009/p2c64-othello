@@ -94,6 +94,12 @@ struct SearchResult {
     uint64_t nodes           = 0;
     double   elapsed_ms      = 0.0;
     bool     exact_solved    = false;
+    uint64_t main_leaves     = 0;
+    uint64_t mpc_leaves      = 0;
+    uint64_t s25_runs        = 0;
+    uint64_t s3_runs         = 0;
+    uint64_t mpc_tries       = 0;
+    uint64_t mpc_cuts        = 0;
 };
 
 class PVSEngine {
@@ -107,6 +113,13 @@ public:
     uint8_t  tt_gen_          = 1;
     int      endgame_empties_ = 10;
 
+    // Standard Multi-ProbCut & WACA-G2 2-stage gating parameters (100% fair across models!)
+    bool     use_mpc_         = false;
+    double   mpc_t_           = 1.80;
+    GateMode gate_mode_       = GateMode::SAFE_BND;
+    int32_t  m25_units_       = 320; // 2.5 discs * 128
+    int32_t  m3_units_        = 192; // 1.5 discs * 128
+
     // Runtime limits & counters
     uint64_t nodes_           = 0;
     uint64_t node_limit_      = 0;
@@ -114,9 +127,36 @@ public:
     bool     aborted_         = false;
     std::chrono::steady_clock::time_point deadline_;
 
+    // Per-search telemetry
+    uint64_t stat_main_leaves_ = 0;
+    uint64_t stat_mpc_leaves_  = 0;
+    uint64_t stat_s25_runs_    = 0;
+    uint64_t stat_s3_runs_     = 0;
+    uint64_t stat_mpc_tries_   = 0;
+    uint64_t stat_mpc_cuts_    = 0;
+
     explicit PVSEngine(const LoadedModel* model, size_t tt_mb = 64, int endgame_empties = 10)
         : model_(model), pt_(get_pattern_tables()), zk_(get_zobrist()), endgame_empties_(endgame_empties) {
         allocate_tt(tt_mb);
+    }
+
+    void set_mpc(bool enable, double t_val = 1.80) noexcept {
+        use_mpc_ = enable;
+        mpc_t_   = t_val;
+    }
+
+    void set_waca_gate(GateMode gm, double m25_discs, double m3_discs) noexcept {
+        gate_mode_ = gm;
+        const double sc = static_cast<double>(model_->score_scale);
+        m25_units_ = static_cast<int32_t>(m25_discs * sc + 0.5);
+        m3_units_  = static_cast<int32_t>(m3_discs * sc + 0.5);
+    }
+
+    static inline double mpc_sigma_discs(int d_sh, int ply) noexcept {
+        if (d_sh <= 1) return 2.65 + 0.030 * static_cast<double>(ply);
+        if (d_sh == 2) return 2.15 + 0.035 * static_cast<double>(ply);
+        if (d_sh == 3) return 1.95 + 0.032 * static_cast<double>(ply);
+        return 1.70 + 0.030 * static_cast<double>(ply);
     }
 
     void allocate_tt(size_t tt_mb) {
@@ -273,10 +313,11 @@ public:
         return best_val;
     }
 
-    // Midgame PVS with Incremental 64-Pattern Index Updates
+    // Midgame PVS with Incremental 64-Pattern Index Updates + Standard MPC + WACA-G2 2-Stage Gating
     int32_t pvs_midgame(uint64_t B, uint64_t W, int stm, int ply, int depth,
                         uint64_t hash, const uint16_t idx[NUM_PATTERNS],
-                        int32_t alpha, int32_t beta, bool prev_pass, int* out_best_move = nullptr) noexcept {
+                        int32_t alpha, int32_t beta, bool prev_pass,
+                        int* out_best_move = nullptr, bool in_mpc_probe = false) noexcept {
         nodes_++;
         if (check_abort()) return 0;
 
@@ -290,7 +331,11 @@ public:
             return pvs_endgame(B, W, stm, empties, hash, alpha, beta, prev_pass);
         }
         if (depth <= 0) {
-            return model_->evaluate(pt_.meta, idx, stm, ply);
+            if (in_mpc_probe) stat_mpc_leaves_++;
+            else              stat_main_leaves_++;
+            return model_->evaluate_search(pt_.meta, idx, B, W, stm, ply, alpha, beta,
+                                           in_mpc_probe, gate_mode_, m25_units_, m3_units_,
+                                           stat_s25_runs_, stat_s3_runs_);
         }
 
         uint8_t tt_move = 64;
@@ -307,6 +352,37 @@ public:
             }
         }
 
+        // Standard Multi-ProbCut (100% identical logic across all models; WACA_G2 probes use MPC-PureV64!)
+        if (use_mpc_ && !out_best_move && !in_mpc_probe &&
+            beta == alpha + 1 && depth >= 5 && empties > endgame_empties_ + 4) {
+            const int d_sh = depth - 4;
+            const double sig = mpc_sigma_discs(d_sh, ply);
+            const int32_t bound_delta = static_cast<int32_t>(
+                mpc_t_ * sig * static_cast<double>(model_->score_scale) + 0.5);
+            stat_mpc_tries_++;
+
+            const int32_t hi = beta + bound_delta;
+            if (hi < SEARCH_INF / 2) {
+                const int32_t v_sh = pvs_midgame(B, W, stm, ply, d_sh, hash, idx,
+                                                 hi - 1, hi, prev_pass, nullptr, true);
+                if (aborted_) return 0;
+                if (v_sh >= hi) {
+                    stat_mpc_cuts_++;
+                    return beta;
+                }
+            }
+            const int32_t lo = alpha - bound_delta;
+            if (lo > -SEARCH_INF / 2) {
+                const int32_t v_sh = pvs_midgame(B, W, stm, ply, d_sh, hash, idx,
+                                                 lo, lo + 1, prev_pass, nullptr, true);
+                if (aborted_) return 0;
+                if (v_sh <= lo) {
+                    stat_mpc_cuts_++;
+                    return alpha;
+                }
+            }
+        }
+
         uint64_t P = (stm > 0) ? B : W;
         uint64_t O = (stm > 0) ? W : B;
         uint64_t mv = generate_moves(P, O);
@@ -319,7 +395,8 @@ public:
                 else if (diff < 0) diff -= empties;
                 return scale_exact(diff);
             }
-            return -pvs_midgame(B, W, -stm, ply, depth, hash ^ zk_.stm_key, idx, -beta, -alpha, true, nullptr);
+            return -pvs_midgame(B, W, -stm, ply, depth, hash ^ zk_.stm_key, idx,
+                                -beta, -alpha, true, nullptr, in_mpc_probe);
         }
 
         int moves[32];
@@ -337,6 +414,7 @@ public:
         int32_t best_val = -SEARCH_INF;
         uint8_t best_sq  = static_cast<uint8_t>(moves[0]);
         uint16_t child_idx[NUM_PATTERNS];
+        const bool need_child_hash = !(depth == 1 && empties - 1 > endgame_empties_);
 
         for (int i = 0; i < n_moves; ++i) {
             int best_idx = i;
@@ -354,14 +432,18 @@ public:
             uint64_t nh = hash ^ zk_.stm_key;
             if (stm > 0) {
                 nB |= (1ULL << sq) | fl; nW ^= fl;
-                nh ^= zk_.sq_b[sq];
-                uint64_t fm = fl;
-                while (fm) { int s = __builtin_ctzll(fm); fm &= fm - 1; nh ^= zk_.sq_b[s] ^ zk_.sq_w[s]; }
+                if (need_child_hash) {
+                    nh ^= zk_.sq_b[sq];
+                    uint64_t fm = fl;
+                    while (fm) { int s = __builtin_ctzll(fm); fm &= fm - 1; nh ^= zk_.sq_b[s] ^ zk_.sq_w[s]; }
+                }
             } else {
                 nW |= (1ULL << sq) | fl; nB ^= fl;
-                nh ^= zk_.sq_w[sq];
-                uint64_t fm = fl;
-                while (fm) { int s = __builtin_ctzll(fm); fm &= fm - 1; nh ^= zk_.sq_b[s] ^ zk_.sq_w[s]; }
+                if (need_child_hash) {
+                    nh ^= zk_.sq_w[sq];
+                    uint64_t fm = fl;
+                    while (fm) { int s = __builtin_ctzll(fm); fm &= fm - 1; nh ^= zk_.sq_b[s] ^ zk_.sq_w[s]; }
+                }
             }
 
             int32_t val;
@@ -377,11 +459,14 @@ public:
             } else {
                 pt_.update_indices_move(child_idx, idx, sq, fl, stm);
                 if (i == 0) {
-                    val = -pvs_midgame(nB, nW, -stm, ply + 1, depth - 1, nh, child_idx, -beta, -alpha, false, nullptr);
+                    val = -pvs_midgame(nB, nW, -stm, ply + 1, depth - 1, nh, child_idx,
+                                       -beta, -alpha, false, nullptr, in_mpc_probe);
                 } else {
-                    val = -pvs_midgame(nB, nW, -stm, ply + 1, depth - 1, nh, child_idx, -alpha - 1, -alpha, false, nullptr);
+                    val = -pvs_midgame(nB, nW, -stm, ply + 1, depth - 1, nh, child_idx,
+                                       -alpha - 1, -alpha, false, nullptr, in_mpc_probe);
                     if (!aborted_ && val > alpha && val < beta) {
-                        val = -pvs_midgame(nB, nW, -stm, ply + 1, depth - 1, nh, child_idx, -beta, -alpha, false, nullptr);
+                        val = -pvs_midgame(nB, nW, -stm, ply + 1, depth - 1, nh, child_idx,
+                                           -beta, -alpha, false, nullptr, in_mpc_probe);
                     }
                 }
             }
@@ -398,14 +483,16 @@ public:
         }
 
         if (!aborted_) {
-            SearchTTEntry& e = tt_[hash & tt_mask_];
-            if (e.flag == TT_NONE || e.gen != tt_gen_ || e.depth <= depth) {
-                e.key       = hash;
-                e.score     = best_val;
-                e.depth     = static_cast<int8_t>(depth);
-                e.flag      = (best_val <= orig_alpha) ? TT_UPPER : ((best_val >= beta) ? TT_LOWER : TT_EXACT);
-                e.best_move = best_sq;
-                e.gen       = tt_gen_;
+            if (!(in_mpc_probe && model_->is_waca)) {
+                SearchTTEntry& e = tt_[hash & tt_mask_];
+                if (e.flag == TT_NONE || e.gen != tt_gen_ || e.depth <= depth) {
+                    e.key       = hash;
+                    e.score     = best_val;
+                    e.depth     = static_cast<int8_t>(depth);
+                    e.flag      = (best_val <= orig_alpha) ? TT_UPPER : ((best_val >= beta) ? TT_LOWER : TT_EXACT);
+                    e.best_move = best_sq;
+                    e.gen       = tt_gen_;
+                }
             }
             if (out_best_move) *out_best_move = static_cast<int>(best_sq);
         }
@@ -426,7 +513,6 @@ public:
         int first_legal = __builtin_ctzll(mv);
         res.best_move = first_legal;
 
-        // If only 1 legal move and not measuring exact score in depth mode, still evaluate if needed
         const int discs   = __builtin_popcountll(B | W);
         const int ply     = discs - 4;
         const int empties = 64 - discs;
@@ -438,17 +524,22 @@ public:
         tt_gen_ = static_cast<uint8_t>((tt_gen_ + 1) & 0xFFU);
         if (tt_gen_ == 0) tt_gen_ = 1;
 
-        nodes_          = 0;
-        aborted_        = false;
-        node_limit_     = (mode == SearchLimitMode::NODES) ? static_cast<uint64_t>(limit_val) : 0ULL;
-        use_time_limit_ = (mode == SearchLimitMode::TIME);
+        nodes_            = 0;
+        aborted_          = false;
+        stat_main_leaves_ = 0;
+        stat_mpc_leaves_  = 0;
+        stat_s25_runs_    = 0;
+        stat_s3_runs_     = 0;
+        stat_mpc_tries_   = 0;
+        stat_mpc_cuts_    = 0;
+        node_limit_       = (mode == SearchLimitMode::NODES) ? static_cast<uint64_t>(limit_val) : 0ULL;
+        use_time_limit_   = (mode == SearchLimitMode::TIME);
         if (use_time_limit_) {
             deadline_ = t0 + std::chrono::milliseconds(limit_val);
         }
 
         // Exact endgame directly when empties <= endgame_empties_
         if (empties <= endgame_empties_) {
-            // Root exact solve (allow completion unless strict time/node abort after move 0)
             int moves[32], n_moves = 0;
             uint64_t m = mv;
             while (m) { moves[n_moves++] = __builtin_ctzll(m); m &= m - 1; }
@@ -486,7 +577,8 @@ public:
             if (d == 1) { node_limit_ = 0; use_time_limit_ = false; }
 
             int cur_best = res.best_move;
-            int32_t val = pvs_midgame(B, W, stm, ply, d, hash, root_idx, -SEARCH_INF, SEARCH_INF, false, &cur_best);
+            int32_t val = pvs_midgame(B, W, stm, ply, d, hash, root_idx,
+                                      -SEARCH_INF, SEARCH_INF, false, &cur_best, false);
 
             if (d == 1) { node_limit_ = saved_nlim; use_time_limit_ = saved_tlim; }
 
@@ -501,13 +593,19 @@ public:
             if (mode == SearchLimitMode::TIME && std::chrono::steady_clock::now() >= deadline_) break;
         }
 
-        res.nodes      = nodes_;
-        res.elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        res.nodes       = nodes_;
+        res.elapsed_ms  = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        res.main_leaves = stat_main_leaves_;
+        res.mpc_leaves  = stat_mpc_leaves_;
+        res.s25_runs    = stat_s25_runs_;
+        res.s3_runs     = stat_s3_runs_;
+        res.mpc_tries   = stat_mpc_tries_;
+        res.mpc_cuts    = stat_mpc_cuts_;
         return res;
     }
 
-    // Fixed-depth score evaluation (used by MPC sigma measurer, no endgame override if disabled)
-    int32_t eval_fixed_depth(uint64_t B, uint64_t W, int stm, int depth) {
+    // Fixed-depth score evaluation (used by MPC sigma measurer; tier1_only=true measures MPC-PureV64!)
+    int32_t eval_fixed_depth(uint64_t B, uint64_t W, int stm, int depth, bool tier1_only = false) {
         const int discs = __builtin_popcountll(B | W);
         const int ply   = discs - 4;
         const uint64_t hash = zk_.hash_board(B, W, stm);
@@ -517,7 +615,12 @@ public:
         tt_gen_ = static_cast<uint8_t>((tt_gen_ + 1) & 0xFFU);
         if (tt_gen_ == 0) tt_gen_ = 1;
         nodes_ = 0; node_limit_ = 0; use_time_limit_ = false; aborted_ = false;
-        return pvs_midgame(B, W, stm, ply, depth, hash, root_idx, -SEARCH_INF, SEARCH_INF, false, nullptr);
+        const bool saved_mpc = use_mpc_;
+        use_mpc_ = false;
+        int32_t sc = pvs_midgame(B, W, stm, ply, depth, hash, root_idx,
+                                 -SEARCH_INF, SEARCH_INF, false, nullptr, tier1_only);
+        use_mpc_ = saved_mpc;
+        return sc;
     }
 };
 

@@ -416,4 +416,123 @@ static inline uint64_t calc_flips(int sq, uint64_t P, uint64_t O) noexcept {
     return flips;
 }
 
+// ============================================================================
+// Pure-Scalar Bitboard Feature Primitives for WACA-G2 (Zero SIMD, Strict D4)
+// ============================================================================
+static inline uint64_t ks_moves_dir_l(uint64_t P, uint64_t mO, uint64_t E, int d) noexcept {
+    uint64_t f  = mO & (P << d);
+    f          |= mO & (f << d);
+    uint64_t m2 = mO & (mO << d);
+    f          |= m2 & (f << (2 * d));
+    f          |= m2 & (f << (2 * d));
+    return E & (f << d);
+}
+
+static inline uint64_t ks_moves_dir_r(uint64_t P, uint64_t mO, uint64_t E, int d) noexcept {
+    uint64_t f  = mO & (P >> d);
+    f          |= mO & (f >> d);
+    uint64_t m2 = mO & (mO >> d);
+    f          |= m2 & (f >> (2 * d));
+    f          |= m2 & (f >> (2 * d));
+    return E & (f >> d);
+}
+
+// Interleaved Kogge-Stone legal move generation for BOTH sides (maximizes scalar OoO ILP)
+static inline void generate_moves_pair(uint64_t P, uint64_t O,
+                                       uint64_t& out_mvP, uint64_t& out_mvO) noexcept {
+    const uint64_t E  = ~(P | O);
+    const uint64_t mO = O & 0x7e7e7e7e7e7e7e7eULL;
+    const uint64_t mP = P & 0x7e7e7e7e7e7e7e7eULL;
+
+    uint64_t rP = ks_moves_dir_l(P, mO, E, 1);
+    uint64_t rO = ks_moves_dir_l(O, mP, E, 1);
+    rP |= ks_moves_dir_r(P, mO, E, 1);
+    rO |= ks_moves_dir_r(O, mP, E, 1);
+    rP |= ks_moves_dir_l(P, O,  E, 8);
+    rO |= ks_moves_dir_l(O, P,  E, 8);
+    rP |= ks_moves_dir_r(P, O,  E, 8);
+    rO |= ks_moves_dir_r(O, P,  E, 8);
+    rP |= ks_moves_dir_l(P, mO, E, 9);
+    rO |= ks_moves_dir_l(O, mP, E, 9);
+    rP |= ks_moves_dir_r(P, mO, E, 9);
+    rO |= ks_moves_dir_r(O, mP, E, 9);
+    rP |= ks_moves_dir_l(P, mO, E, 7);
+    rO |= ks_moves_dir_l(O, mP, E, 7);
+    rP |= ks_moves_dir_r(P, mO, E, 7);
+    rO |= ks_moves_dir_r(O, mP, E, 7);
+
+    out_mvP = rP;
+    out_mvO = rO;
+}
+
+// 8-neighbor adjacency bitmask (9 pure-scalar ALU ops, strictly D4-invariant)
+static inline uint64_t adj_mask_bb(uint64_t bb) noexcept {
+    const uint64_t h = ((bb << 1) & 0xfefefefefefefefeULL) | ((bb >> 1) & 0x7f7f7f7f7f7f7f7fULL);
+    const uint64_t b = bb | h;
+    return h | (b << 8) | (b >> 8);
+}
+
+// Pure-scalar inline SWAR popcount (avoids slow __popcountdi2@plt calls under -mno-sse4.2!)
+static inline int popcount64_swar(uint64_t x) noexcept {
+    x -= (x >> 1) & 0x5555555555555555ULL;
+    x = (x & 0x3333333333333333ULL) + ((x >> 2) & 0x3333333333333333ULL);
+    x = (x + (x >> 4)) & 0x0f0f0f0f0f0f0f0fULL;
+    return static_cast<int>((x * 0x0101010101010101ULL) >> 56);
+}
+
+// Fast 0-imul pure-scalar popcount for 4 corners (bits 0, 7, 56, 63) and 4 X-squares (bits 9, 14, 49, 54)
+static inline int popcount4_corners(uint64_t mv) noexcept {
+    return static_cast<int>((mv & 1ULL) + ((mv >> 7) & 1ULL) + ((mv >> 56) & 1ULL) + (mv >> 63));
+}
+static inline int popcount4_xsqs(uint64_t mv) noexcept {
+    return static_cast<int>(((mv >> 9) & 1ULL) + ((mv >> 14) & 1ULL) + ((mv >> 49) & 1ULL) + ((mv >> 54) & 1ULL));
+}
+
+// Branchless pure-scalar corner-anchored edge + 1-round interior stability (strictly D4-invariant)
+static inline int count_edge_stable_bb(uint64_t P) noexcept {
+    constexpr uint64_t CORNERS = 0x8100000000000081ULL;
+    const uint64_t s0 = P & CORNERS;
+    if (!s0) return 0;
+
+    constexpr uint64_t H_MASK = 0xff000000000000ffULL;
+    constexpr uint64_t V_MASK = 0x8181818181818181ULL;
+    const uint64_t pH = P & H_MASK;
+    const uint64_t pV = P & V_MASK;
+
+    const uint64_t mHl = pH & 0xfefefefefefefefeULL;
+    uint64_t h1 = s0 | (mHl & (s0 << 1));
+    const uint64_t m2l = mHl & (mHl << 1);
+    h1 |= m2l & (h1 << 2);
+    h1 |= m2l & (h1 << 2);
+    h1 |= m2l & (h1 << 2);
+
+    const uint64_t mHr = pH & 0x7f7f7f7f7f7f7f7fULL;
+    uint64_t h2 = s0 | (mHr & (s0 >> 1));
+    const uint64_t m2r = mHr & (mHr >> 1);
+    h2 |= m2r & (h2 >> 2);
+    h2 |= m2r & (h2 >> 2);
+    h2 |= m2r & (h2 >> 2);
+
+    uint64_t v1 = s0 | (pV & (s0 << 8));
+    const uint64_t m2d = pV & (pV << 8);
+    v1 |= m2d & (v1 << 16);
+    v1 |= m2d & (v1 << 16);
+    v1 |= m2d & (v1 << 16);
+
+    uint64_t v2 = s0 | (pV & (s0 >> 8));
+    const uint64_t m2u = pV & (pV >> 8);
+    v2 |= m2u & (v2 >> 16);
+    v2 |= m2u & (v2 >> 16);
+    v2 |= m2u & (v2 >> 16);
+
+    uint64_t st = h1 | h2 | v1 | v2;
+    // 1-round exact 4-axis interior triangle stability propagation
+    const uint64_t ax_h  = ((st << 1) & 0xfefefefefefefefeULL) | ((st >> 1) & 0x7f7f7f7f7f7f7f7fULL);
+    const uint64_t ax_v  = (st << 8) | (st >> 8);
+    const uint64_t ax_d1 = ((st << 9) & 0xfefefefefefefefeULL) | ((st >> 9) & 0x7f7f7f7f7f7f7f7fULL);
+    const uint64_t ax_d2 = ((st << 7) & 0x7f7f7f7f7f7f7f7fULL) | ((st >> 7) & 0xfefefefefefefefeULL);
+    st |= P & ax_h & ax_v & ax_d1 & ax_d2;
+    return popcount64_swar(st);
+}
+
 } // namespace p2c64

@@ -228,6 +228,87 @@ int main() {
         [&](const uint16_t* idx, int stm, int ply) { return evaluate_p2c64<EvalMode::CAND_C_PTM_HYBRID>(w, pt.meta, idx, stm, ply); },
         ref_eval, ref_tt);
 
+    // ------------------------------------------------------------------------
+    // WACA-G2 v3.0 Standalone Stage Benchmarks (Stage 1 / Stage 2.5 / Stage 3)
+    // ------------------------------------------------------------------------
+    WacaG2Weights wg2;
+    wg2.mlp_hidden = 16;
+    wg2.tier1 = raw;
+    for (int ply = 0; ply < NUM_PLIES; ++ply) {
+        wg2.s25[ply].b = 128;
+        for (int i = 0; i < WACA_F25; ++i) wg2.s25[ply].w[i] = static_cast<int16_t>(((ply + i) & 1) ? 45 : -35);
+        wg2.screlu[ply] = w.screlu[ply];
+        wg2.mlp[ply].b2 = 64;
+        for (int j = 0; j < 16; ++j) {
+            wg2.mlp[ply].b1[j] = 4096;
+            wg2.mlp[ply].w2[j] = static_cast<int16_t>((j & 1) ? 24 : -18);
+            for (int i = 0; i < WACA_F3; ++i) wg2.mlp[ply].w1[j][i] = static_cast<int8_t>(((j * 7 + i * 3) % 31) - 15);
+        }
+    }
+    for (int b = 0; b < WACA_EO_BLOCKS; ++b) {
+        for (auto& e : wg2.h_emb[b]) {
+            e.h[0] = static_cast<int8_t>((rng.next() & 127U) - 64);
+            e.h[1] = static_cast<int8_t>((rng.next() & 127U) - 64);
+            e.h[2] = static_cast<int8_t>((rng.next() & 127U) - 64);
+            e.h[3] = static_cast<int8_t>((rng.next() & 127U) - 64);
+        }
+    }
+
+    // Reconstruct realistic midgame bitboards for Stage 2.5 / Stage 3 standalone microbenchmark
+    std::vector<std::pair<uint64_t, uint64_t>> boards(leaves.size());
+    for (size_t i = 0; i < leaves.size(); ++i) {
+        uint64_t P = 0, O = 0;
+        for (int sq = 0; sq < 64; ++sq) {
+            uint64_t r = rng.next() % 3ULL;
+            if (r == 1) P |= (1ULL << sq);
+            else if (r == 2) O |= (1ULL << sq);
+        }
+        boards[i] = {P, O};
+    }
+
+    bench_one("7. WACA_G2 Stage 1 (Tier1)", leaves, tt,
+        [&](const uint16_t* idx, int stm, int ply) {
+            return (stm < 0) ? eval_waca_stage1_ptm<true>(wg2.tier1, pt.meta, idx, ply)
+                             : eval_waca_stage1_ptm<false>(wg2.tier1, pt.meta, idx, ply);
+        },
+        ref_eval, ref_tt);
+
+    volatile int64_t sink_w = 0;
+    int32_t c_dum[4] = {120, -40, 85, -15}, e_dum[4] = {55, -25, 10, 30};
+    int32_t f25_buf[WACA_F25]{};
+
+    auto t_s25 = std::chrono::steady_clock::now();
+    for (int pass = 0; pass < 6; ++pass) {
+        for (size_t i = 0; i < leaves.size(); ++i) {
+            sink_w += eval_waca_stage25_kernel(wg2, boards[i].first, boards[i].second,
+                                               128, c_dum, e_dum, leaves[i].ply, f25_buf);
+        }
+    }
+    const double s25_ns = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_s25).count()
+                        * 1e9 / (6.0 * static_cast<double>(leaves.size()));
+
+    auto t_s3 = std::chrono::steady_clock::now();
+    for (int pass = 0; pass < 6; ++pass) {
+        for (size_t i = 0; i < leaves.size(); ++i) {
+            const auto& lf = leaves[i];
+            sink_w += (lf.stm < 0)
+                    ? eval_waca_stage3_ptm<true>(wg2, pt.meta, lf.idx, boards[i].first, boards[i].second,
+                                                 c_dum, e_dum, f25_buf, 16, lf.ply)
+                    : eval_waca_stage3_ptm<false>(wg2, pt.meta, lf.idx, boards[i].first, boards[i].second,
+                                                  c_dum, e_dum, f25_buf, 16, lf.ply);
+        }
+    }
+    const double s3_ns = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_s3).count()
+                       * 1e9 / (6.0 * static_cast<double>(leaves.size()));
+
+    std::printf("\n=== WACA-G2 v3.0 Standalone Stage Microbenchmark (H=16, Zero SIMD) ===\n");
+    std::printf("  Stage 2.5 (16-dim global mob+geom linear) : %6.1f ns/call  (amortized @15%% = %4.1f ns/leaf)\n",
+                s25_ns, s25_ns * 0.15);
+    std::printf("  Stage 3   (20-blk EO Key14 + 24->16->1)   : %6.1f ns/call  (amortized @ 5%% = %4.1f ns/leaf)\n",
+                s3_ns, s3_ns * 0.05);
+    std::printf("  Amortized 2-Stage Overhead (15%% S2.5 + 5%% S3): %5.1f ns/leaf (chk:%02llx)\n",
+                s25_ns * 0.15 + s3_ns * 0.05, static_cast<unsigned long long>(sink_w & 0xFF));
+
     std::free(tt);
     return 0;
 }
