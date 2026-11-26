@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Bit-exact verification of Python .p2c I/O + integer simulator vs C++ pure-scalar kernels,
-plus full 16-symmetry (D4 x Z2) invariance audit and OpenMP batch-bridge throughput benchmark."""
+"""Bit-exact verification of Python .p2c v2.0 I/O + integer simulator vs C++ pure-scalar kernels,
+RAW==LINEAR identity verification, 16-symmetry (D4 x Z2) audit, and OpenMP bridge throughput."""
 
 from __future__ import annotations
 
@@ -15,9 +15,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from p2c64_bridge import (
-    CORNER_CANON_SIZE,
-    CORNER_RAW_SIZE,
-    KEY_CANON_ENTRIES,
+    KEY_RAW_ENTRIES,
     NONKEY_RAW_ENTRIES,
     NUM_BLOCKS,
     NUM_PLIES,
@@ -27,12 +25,12 @@ from p2c64_bridge import (
 )
 from p2c64_io import (
     EvalMode,
-    P2C64Model,
     RawNTupleModel,
     eval_p2c64_int_batch,
     eval_raw_ntuple64_int_batch,
     load_p2c,
     make_empty_p2c64,
+    raw_to_linear_p2c64,
     save_p2c64,
     save_raw_p2c,
     symmetrize_p2c64_model,
@@ -55,7 +53,6 @@ def load_positions(data_bin: Path | None, n: int) -> Tuple[np.ndarray, np.ndarra
             np.ascontiguousarray(arr["ply"], dtype=np.uint8),
         )
 
-    # Fallback: synthetic valid random board states
     rng = np.random.default_rng(20261125)
     blacks = np.zeros(n, dtype=np.uint64)
     whites = np.zeros(n, dtype=np.uint64)
@@ -85,21 +82,15 @@ def verify_p2c_file(
     white: np.ndarray,
     stm: np.ndarray,
     ply: np.ndarray,
-) -> None:
+) -> np.ndarray:
     model = load_p2c(p2c_path)
     if isinstance(model, RawNTupleModel):
-        ext = bridge.extract_batch(
-            black, white, stm, enable_aug=False, need_raw_idx=True, need_p2c=False, need_raw_flat=True
-        )
-        py_scores = eval_raw_ntuple64_int_batch(model, ext["raw_flat"], ext["raw_idx"], stm, ply)
+        ext = bridge.extract_batch_ptm(black, white, stm, enable_aug=False, need_p2c=False, need_raw=True)
+        py_scores = eval_raw_ntuple64_int_batch(model, ext["raw_ptm"], ply)
         mode_name = "RAW_NTUPLE_64"
     else:
-        ext = bridge.extract_batch(
-            black, white, stm, enable_aug=False, need_raw_idx=False, need_p2c=True, need_raw_flat=False
-        )
-        py_scores = eval_p2c64_int_batch(
-            model, ext["key_cx"], ext["key_flip"], ext["nonkey_flat"], stm, ply
-        )
+        ext = bridge.extract_batch_ptm(black, white, stm, enable_aug=False, need_p2c=True, need_raw=False)
+        py_scores = eval_p2c64_int_batch(model, ext["key_ptm"], ext["nonkey_ptm"], ply)
         mode_name = model.mode.name
 
     cpp_mode, cpp_scores, max_sym_err = bridge.eval_file_batch(
@@ -121,6 +112,7 @@ def verify_p2c_file(
             idx = int(bad[0])
             print(f"       First mismatch at i={idx}: ply={ply[idx]} stm={stm[idx]} py={py_scores[idx]} cpp={cpp_scores[idx]}")
         sys.exit(1)
+    return cpp_scores
 
 
 def run_synthetic_roundtrip(bridge: P2C64Bridge, tmp_dir: Path, black, white, stm, ply) -> None:
@@ -128,34 +120,40 @@ def run_synthetic_roundtrip(bridge: P2C64Bridge, tmp_dir: Path, black, white, st
     rng = np.random.default_rng(12345)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) RAW_NTUPLE_64
+    # 1) RAW_NTUPLE_64 + shared LINEAR_64 bit-exactness check
     raw = RawNTupleModel(
         w_ply=rng.integers(-2000, 2001, size=(NUM_PLIES, TOTAL_RAW_ENTRIES), dtype=np.int16),
-        corner_tempo=rng.integers(-64, 65, size=(NUM_PLIES, CORNER_RAW_SIZE), dtype=np.int8),
     )
     raw = symmetrize_raw_model(raw, orbits)
     raw_p = tmp_dir / "synth_raw.p2c"
     save_raw_p2c(raw_p, raw)
-    verify_p2c_file(bridge, raw_p, black, white, stm, ply)
+    sc_raw = verify_p2c_file(bridge, raw_p, black, white, stm, ply)
 
-    # 2..5) LINEAR_64, CAND_A, CAND_B, CAND_C
+    lin = raw_to_linear_p2c64(raw)
+    lin_p = tmp_dir / "synth_linear64.p2c"
+    save_p2c64(lin_p, lin)
+    sc_lin = verify_p2c_file(bridge, lin_p, black, white, stm, ply)
+    raw_lin_err = int(np.abs(sc_raw.astype(np.int64) - sc_lin.astype(np.int64)).max())
+    if raw_lin_err != 0:
+        print(f"[FAIL] synth RAW != LINEAR (max_err={raw_lin_err})")
+        sys.exit(1)
+    print(f"[PASS] synth RAW_NTUPLE_64 == LINEAR_64 bit-exact identity (max_err=0)")
+
+    # 2) CAND_A, CAND_B, CAND_C
     for mode in (
-        EvalMode.LINEAR_64,
-        EvalMode.CAND_A_SCRELU_K2,
-        EvalMode.CAND_B_3W3B,
-        EvalMode.CAND_C_HYBRID,
+        EvalMode.CAND_A_PTM_SCRELU4,
+        EvalMode.CAND_B_PTM_3W3B,
+        EvalMode.CAND_C_PTM_HYBRID,
     ):
         m = make_empty_p2c64(mode)
-        m.key_blocks["w"] = rng.integers(-2000, 2001, size=(NUM_BLOCKS, KEY_CANON_ENTRIES, 6), dtype=np.int16)
-        m.key_blocks["aux"] = rng.integers(0, 256, size=(NUM_BLOCKS, KEY_CANON_ENTRIES, 4), dtype=np.uint8)
+        m.key_blocks["w"] = rng.integers(-2000, 2001, size=(NUM_BLOCKS, KEY_RAW_ENTRIES, 6), dtype=np.int16)
+        m.key_blocks["aux"] = rng.integers(0, 256, size=(NUM_BLOCKS, KEY_RAW_ENTRIES, 4), dtype=np.uint8)
         m.nonkey_w = rng.integers(-2000, 2001, size=(NUM_PLIES, NONKEY_RAW_ENTRIES), dtype=np.int16)
-        m.corner_tempo = rng.integers(-64, 65, size=(NUM_BLOCKS, CORNER_CANON_SIZE), dtype=np.int8)
-        m.screlu_mu = rng.integers(8, 64, size=(NUM_BLOCKS, 3, 2), dtype=np.int32)
-        m.screlu_beta_sq = rng.integers(-400, 401, size=(NUM_BLOCKS, 3, 2), dtype=np.int32)
-        m.screlu_beta_pr = rng.integers(-400, 401, size=(NUM_BLOCKS, 3), dtype=np.int32)
-        m.macro_cw = rng.integers(-600, 601, size=(NUM_BLOCKS, 512), dtype=np.int16)
-        m.macro_ea = rng.integers(-600, 601, size=(NUM_BLOCKS, 512), dtype=np.int16)
-        m.macro_cd = rng.integers(-600, 601, size=(NUM_BLOCKS, 512), dtype=np.int16)
+        m.screlu_mu = rng.integers(8, 64, size=(NUM_PLIES, 3, 4), dtype=np.int16)
+        m.screlu_beta = rng.integers(-400, 401, size=(NUM_PLIES, 3, 4), dtype=np.int16)
+        m.macro_cw = rng.integers(-600, 601, size=(NUM_PLIES, 512), dtype=np.int16)
+        m.macro_ea = rng.integers(-600, 601, size=(NUM_PLIES, 512), dtype=np.int16)
+        m.macro_cd = rng.integers(-600, 601, size=(NUM_PLIES, 512), dtype=np.int16)
         m = symmetrize_p2c64_model(m, orbits)
         p = tmp_dir / f"synth_{mode.name.lower()}.p2c"
         save_p2c64(p, m)
@@ -169,29 +167,27 @@ def bench_bridge(bridge: P2C64Bridge, black, white, stm) -> None:
     s_big = np.tile(stm, reps)
     n = len(b_big)
 
-    # Warmup
-    bridge.extract_batch(b_big[:1024], w_big[:1024], s_big[:1024], aug_seed=1, enable_aug=True, need_p2c=True)
-
+    bridge.extract_batch_ptm(b_big[:1024], w_big[:1024], s_big[:1024], aug_seed=1, enable_aug=True, need_p2c=True)
     t0 = time.perf_counter()
-    bridge.extract_batch(b_big, w_big, s_big, aug_seed=42, enable_aug=True, need_p2c=True)
+    bridge.extract_batch_ptm(b_big, w_big, s_big, aug_seed=42, enable_aug=True, need_p2c=True)
     dt = time.perf_counter() - t0
-    print(f"[BENCH] C++ OpenMP Batch Bridge (aug=ON, 64-pat P2C): {n:,} pos in {dt*1000:.1f} ms -> {n/dt/1e6:.2f} M pos/s")
+    print(f"[BENCH] C++ OpenMP PTM Batch Bridge (aug=ON, 64-pat P2C v2.0): {n:,} pos in {dt*1000:.1f} ms -> {n/dt/1e6:.2f} M pos/s")
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Verify C++/Python bit-exact .p2c I/O & 16-symmetry invariance")
-    ap.add_argument("--data", type=Path, default=None, help="Optional val.bin for real test positions")
-    ap.add_argument("--num-pos", type=int, default=1000, help="Number of test positions (default: 1000)")
-    ap.add_argument("--models", type=Path, nargs="*", default=None, help="Explicit .p2c files to verify")
-    ap.add_argument("--work-dir", type=Path, default=None, help="Directory containing trained .p2c files")
-    ap.add_argument("--synthetic", action="store_true", help="Also run synthetic 5-mode roundtrip test")
-    ap.add_argument("--bench-bridge", action="store_true", help="Benchmark C++ OpenMP batch bridge throughput")
+    ap = argparse.ArgumentParser(description="Verify C++/Python bit-exact .p2c v2.0 I/O & 16-symmetry invariance")
+    ap.add_argument("--data", type=Path, default=None)
+    ap.add_argument("--num-pos", type=int, default=1000)
+    ap.add_argument("--models", type=Path, nargs="*", default=None)
+    ap.add_argument("--work-dir", type=Path, default=None)
+    ap.add_argument("--synthetic", action="store_true")
+    ap.add_argument("--bench-bridge", action="store_true")
     args = ap.parse_args()
 
     bridge = P2C64Bridge()
     black, white, stm, ply = load_positions(args.data, args.num_pos)
 
-    print(f"=== P2C-64 C++/Python Bit-Exact I/O & 16-Symmetry Test ({len(black)} positions) ===")
+    print(f"=== P2C-64 v2.0 C++/Python Bit-Exact I/O & 16-Symmetry Test ({len(black)} positions) ===")
     files: List[Path] = []
     if args.models:
         files.extend(args.models)
@@ -199,9 +195,9 @@ def main() -> None:
         for name in (
             "raw_ntuple64.p2c",
             "linear64.p2c",
-            "cand_a_screlu_k2.p2c",
-            "cand_b_3w3b.p2c",
-            "cand_c_hybrid.p2c",
+            "cand_a_ptm_screlu4.p2c",
+            "cand_b_ptm_3w3b.p2c",
+            "cand_c_ptm_hybrid.p2c",
         ):
             p = args.work_dir / name
             if p.exists():
@@ -211,8 +207,16 @@ def main() -> None:
         tmp_dir = (args.work_dir / "_synth_tmp") if args.work_dir else Path("build/_synth_tmp")
         run_synthetic_roundtrip(bridge, tmp_dir, black, white, stm, ply)
 
+    scores_by_name = {}
     for p in files:
-        verify_p2c_file(bridge, p, black, white, stm, ply)
+        scores_by_name[p.name] = verify_p2c_file(bridge, p, black, white, stm, ply)
+
+    if "raw_ntuple64.p2c" in scores_by_name and "linear64.p2c" in scores_by_name:
+        err = int(np.abs(scores_by_name["raw_ntuple64.p2c"].astype(np.int64) - scores_by_name["linear64.p2c"].astype(np.int64)).max())
+        if err != 0:
+            print(f"[FAIL] Trained RAW_NTUPLE_64 != LINEAR_64 (max_err={err})")
+            sys.exit(1)
+        print("[PASS] Trained RAW_NTUPLE_64 == LINEAR_64 bit-exact identity (max_err=0)")
 
     if args.bench_bridge:
         bench_bridge(bridge, black, white, stm)

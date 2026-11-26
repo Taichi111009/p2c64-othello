@@ -74,11 +74,13 @@ struct PatternDef {
 };
 
 struct PatternMeta {
-    int32_t maxv;       // 3^len - 1
-    int32_t half;       // (3^len - 1) / 2
-    int32_t canon_off;  // offset in canonical BlockEntry16 array (types 0..3 -> 0..45928)
-    int32_t raw_off;    // offset in full 64-pat RawNTuple64 array
-    int32_t nonkey_off; // offset in non-key 50-pat 2B direct array (types 4..15 -> 0..318167)
+    int32_t maxv;           // 3^len - 1
+    int32_t half;           // (3^len - 1) / 2
+    int32_t canon_off;      // legacy canonical offset (v1.x)
+    int32_t raw_off;        // offset in full 64-pat RawNTuple64 (and Key-14 0..91853 for p<14)
+    int32_t raw_off_end;    // raw_off + maxv (1-sub PTM lookup for White-to-move)
+    int32_t nonkey_off;     // offset in non-key 50-pat 2B array (types 4..15 -> 0..318167)
+    int32_t nonkey_off_end; // nonkey_off + maxv (1-sub PTM lookup for White-to-move)
 };
 
 struct SqPatternUpdate {
@@ -105,8 +107,9 @@ struct PatternTables {
     int32_t         type_nonkey_off[NUM_PATTERN_TYPES]{};
     int32_t         total_canon_entries  = 0; // All 16 types: 205,019
     int32_t         key_canon_entries    = 0; // Key 4 types (0..3): 45,929
-    int32_t         total_raw_entries    = 0; // All 16 types: 410,022
-    int32_t         nonkey_raw_entries   = 0; // Non-key 12 types (4..15): 318,168
+    int32_t         key_raw_entries      = 0; // Key 4 types (0..3) PTM: 91,854
+    int32_t         total_raw_entries    = 0; // All 16 types PTM: 410,022
+    int32_t         nonkey_raw_entries   = 0; // Non-key 12 types (4..15) PTM: 318,168
     TypeSymSpec     type_sym[NUM_PATTERN_TYPES]{};
 
     SqPatternUpdate sq_upd[64][16]{};
@@ -196,9 +199,10 @@ struct PatternTables {
         // Type 15: Center 2x4 (8 sqs) x2 (Horizontal 2x4 & Vertical 4x2; exact 2-instance D4 orbit)
         add_rot2(15, {rc(3,2),rc(3,3),rc(3,4),rc(3,5), rc(4,2),rc(4,3),rc(4,4),rc(4,5)});
 
-        // Offsets and canonical/raw sizes (Asymmetric Layout: Key 0..3 vs Non-key 4..15)
+        // Offsets and PTM/canonical sizes (v2.0 Asymmetric Layout: Key 0..3 [91,854] vs Non-key 4..15 [318,168])
         total_canon_entries = 0;
         key_canon_entries   = 0;
+        key_raw_entries     = 0;
         total_raw_entries   = 0;
         nonkey_raw_entries  = 0;
         for (int t = 0; t < NUM_PATTERN_TYPES; ++t) {
@@ -210,6 +214,7 @@ struct PatternTables {
             type_raw_off[t]  = total_raw_entries;
             type_raw_size[t] = POW3[type_len[t]];
             total_raw_entries += type_raw_size[t];
+            if (t < 4) key_raw_entries += type_raw_size[t];
 
             if (t >= 4) {
                 type_nonkey_off[t] = nonkey_raw_entries;
@@ -222,11 +227,13 @@ struct PatternTables {
         for (int p = 0; p < NUM_PATTERNS; ++p) {
             int t = pats[p].type;
             int len = pats[p].len;
-            meta[p].maxv       = POW3[len] - 1;
-            meta[p].half       = (POW3[len] - 1) >> 1;
-            meta[p].canon_off  = type_canon_off[t];
-            meta[p].raw_off    = type_raw_off[t];
-            meta[p].nonkey_off = type_nonkey_off[t];
+            meta[p].maxv           = POW3[len] - 1;
+            meta[p].half           = (POW3[len] - 1) >> 1;
+            meta[p].canon_off      = type_canon_off[t];
+            meta[p].raw_off        = type_raw_off[t];
+            meta[p].raw_off_end    = type_raw_off[t] + meta[p].maxv;
+            meta[p].nonkey_off     = type_nonkey_off[t];
+            meta[p].nonkey_off_end = type_nonkey_off[t] + meta[p].maxv;
         }
 
         // Square -> Pattern incremental update table

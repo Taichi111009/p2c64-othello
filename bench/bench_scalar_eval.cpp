@@ -31,9 +31,6 @@ struct Rng {
     uint64_t next() noexcept { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; }
 };
 
-// Record realistic midgame (ply 20..40) DFS Alpha-Beta search leaves
-// Depth-8..10 locality is reproduced by traversing a bounded-branching (top-3/4 moves) DFS tree
-// of depth 8..10 from real midgame roots (ply 20..32 -> leaves at ply 28..40), yielding 200,000 leaves!
 static void dfs_collect(const PatternTables& pt,
                         uint64_t B, uint64_t W, int stm, int ply, int rem_depth,
                         uint64_t hash, const uint16_t idx[NUM_PATTERNS],
@@ -59,7 +56,6 @@ static void dfs_collect(const PatternTables& pt,
         return;
     }
 
-    // Mimic Alpha-Beta PV/Cut branching factor (~3 moves expanded per internal node at depth 8..10)
     int expanded = 0;
     const int max_branch = (rem_depth >= 5) ? 4 : 3;
     uint16_t child_idx[NUM_PATTERNS];
@@ -89,7 +85,7 @@ static std::vector<RecordedLeaf> build_dfs_replay_trace(size_t total_leaves) {
         uint64_t B = (1ULL << rc(3, 4)) | (1ULL << rc(4, 3));
         uint64_t W = (1ULL << rc(3, 3)) | (1ULL << rc(4, 4));
         int stm = 1;
-        int root_ply = 20 + (r % 11); // roots at ply 20..30 -> depth 9 leaves at ply 29..39
+        int root_ply = 20 + (r % 11);
         int cur_ply = 0;
         while (cur_ply < root_ply) {
             uint64_t P = (stm > 0) ? B : W;
@@ -108,8 +104,7 @@ static std::vector<RecordedLeaf> build_dfs_replay_trace(size_t total_leaves) {
         }
         uint16_t root_idx[NUM_PATTERNS];
         pt.extract_indices(B, W, root_idx);
-        const int depth = 9; // depth-9 DFS tree
-        dfs_collect(pt, B, W, stm, cur_ply, depth, rng.next(), root_idx, leaves, leaves.size() + per_root);
+        dfs_collect(pt, B, W, stm, cur_ply, 9, rng.next(), root_idx, leaves, leaves.size() + per_root);
     }
     return leaves;
 }
@@ -125,10 +120,8 @@ static void bench_one(const char* name,
     constexpr int PASSES_TT   = 4;
     volatile int64_t sink = 0;
 
-    // Warmup 1 pass
     for (const auto& lf : leaves) sink += eval_fn(lf.idx, lf.stm, lf.ply);
 
-    // 1) Pure Eval-only (realistic DFS search-tree locality)
     auto t0 = std::chrono::steady_clock::now();
     for (int pass = 0; pass < PASSES_EVAL; ++pass) {
         for (const auto& lf : leaves) {
@@ -138,7 +131,6 @@ static void bench_one(const char* name,
     double eval_ns = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
                    * 1e9 / (static_cast<double>(PASSES_EVAL) * static_cast<double>(leaves.size()));
 
-    // 2) Eval + Active 256 MiB TT Contention (random read + write per leaf)
     auto t1 = std::chrono::steady_clock::now();
     for (int pass = 0; pass < PASSES_TT; ++pass) {
         for (const auto& lf : leaves) {
@@ -169,39 +161,30 @@ int main() {
     const auto& pt = get_pattern_tables();
     Rng rng(0x13579bdf2468ace0ULL);
 
-    // Initialize RawNTuple64 (60 plies x 2B w + 60 plies x 1B corner-4 tempo = 48.05 MiB)
+    // Initialize RawNTuple64 (46.92 MiB true PTM) and copy identical linear weights to P2C64Weights!
     RawNTuple64Weights raw;
     for (int ply = 0; ply < NUM_PLIES; ++ply) {
-        for (int16_t& v : raw.w_ply[ply])        v = static_cast<int16_t>((rng.next() & 511U) - 256);
-        for (int8_t&  v : raw.corner_tempo[ply]) v = static_cast<int8_t>((rng.next() & 63U) - 32);
+        for (int16_t& v : raw.w_ply[ply]) v = static_cast<int16_t>((rng.next() & 511U) - 256);
     }
 
-    // Initialize P2C64Weights v1.1 Asymmetric Layout (7.01 MiB Key-14 + 36.41 MiB NonKey-50 + 96.1 KiB Tempo + 30 KiB MacroLUT)
     P2C64Weights w;
+    w.load_linear_from_raw(raw);
     for (int b = 0; b < NUM_BLOCKS; ++b) {
         for (auto& e : w.key_blocks[b]) {
-            for (int k = 0; k < PLIES_PER_BLOCK; ++k) e.w[k] = static_cast<int16_t>((rng.next() & 511U) - 256);
             for (int k = 0; k < 4; ++k) e.aux[k] = static_cast<uint8_t>(rng.next() & 0xFFU);
-        }
-        for (int8_t& t : w.corner_tempo[b]) {
-            t = static_cast<int8_t>((rng.next() & 63U) - 32);
-        }
-        for (int g = 0; g < 3; ++g) {
-            w.screlu[b].mu[g][0]      = 32;
-            w.screlu[b].mu[g][1]      = 16;
-            w.screlu[b].beta_sq[g][0] = 64;
-            w.screlu[b].beta_sq[g][1] = -48;
-            w.screlu[b].beta_pr[g]    = 32;
-        }
-        for (int k = 0; k < 512; ++k) {
-            w.macro[b].t_cw[k] = static_cast<int16_t>((rng.next() & 255U) - 128);
-            w.macro[b].t_ea[k] = static_cast<int16_t>((rng.next() & 255U) - 128);
-            w.macro[b].t_cd[k] = static_cast<int16_t>((rng.next() & 255U) - 128);
         }
     }
     for (int ply = 0; ply < NUM_PLIES; ++ply) {
-        for (int16_t& v : w.nonkey_w[ply]) {
-            v = static_cast<int16_t>((rng.next() & 511U) - 256);
+        for (int g = 0; g < 3; ++g) {
+            for (int k = 0; k < 4; ++k) {
+                w.screlu[ply].mu[g][k]   = 16;
+                w.screlu[ply].beta[g][k] = static_cast<int16_t>((k & 1) ? -48 : 64);
+            }
+        }
+        for (int k = 0; k < 512; ++k) {
+            w.macro[ply].t_cw[k] = static_cast<int16_t>((rng.next() & 255U) - 128);
+            w.macro[ply].t_ea[k] = static_cast<int16_t>((rng.next() & 255U) - 128);
+            w.macro[ply].t_cd[k] = static_cast<int16_t>((rng.next() & 255U) - 128);
         }
     }
 
@@ -210,41 +193,39 @@ int main() {
     std::memset(tt, 0, TT_SIZE * sizeof(TTEntry));
 
     auto leaves = build_dfs_replay_trace(200000);
-    const double raw_mib = (static_cast<double>(pt.total_raw_entries) * 2.0 + static_cast<double>(CORNER_RAW_SIZE))
-                         * NUM_PLIES / (1024.0 * 1024.0);
-    const double key_mib = static_cast<double>(pt.key_canon_entries) * sizeof(BlockEntry16) * NUM_BLOCKS / (1024.0 * 1024.0);
+    const double raw_mib = static_cast<double>(pt.total_raw_entries) * 2.0 * NUM_PLIES / (1024.0 * 1024.0);
+    const double key_mib = static_cast<double>(pt.key_raw_entries) * sizeof(BlockEntry16) * NUM_BLOCKS / (1024.0 * 1024.0);
     const double nk_mib  = static_cast<double>(pt.nonkey_raw_entries) * sizeof(int16_t) * NUM_PLIES / (1024.0 * 1024.0);
-    const double tmp_kib = static_cast<double>(CORNER_CANON_SIZE) * NUM_BLOCKS / 1024.0;
-    const double p2c_mib = key_mib + nk_mib + tmp_kib / 1024.0;
+    const double p2c_mib = key_mib + nk_mib;
 
-    std::printf("=== P2C-64 v1.1 (Milestone 1.5) Pure-Scalar Evaluation Benchmark (Zero SIMD) ===\n");
+    std::printf("=== P2C-64 v2.0 (Full PTM) Pure-Scalar Evaluation Benchmark (Zero SIMD) ===\n");
     std::printf("Replay Trace : %zu midgame DFS leaves (roots ply 20..30, depth=9, leaves ply 29..39)\n", leaves.size());
-    std::printf("Table Sizes  : RAW_NTUPLE_64 = %.2f MiB (2B w + 1B c4-tempo x 60)\n", raw_mib);
-    std::printf("               P2C-64 v1.1   = %.2f MiB (Key-14 16B: %.2f MiB + NonKey-50 2B: %.2f MiB + Tempo: %.1f KiB + 30 KiB MacroLUT)\n",
-                p2c_mib, key_mib, nk_mib, tmp_kib);
+    std::printf("Table Sizes  : RAW_NTUPLE_64 = %.2f MiB (64-pat PTM x 2B x 60)\n", raw_mib);
+    std::printf("               P2C-64 v2.0   = %.2f MiB (Key-14 16B: %.2f MiB + NonKey-50 2B: %.2f MiB | +2.81 KiB SCReLU / +180 KiB MacroLUT)\n",
+                p2c_mib, key_mib, nk_mib);
     std::printf("TT Contention: 256 MiB Transposition Table (16,777,216 x 16B random R/W per leaf)\n\n");
     std::printf("%-28s | %-30s | %-30s | %s\n",
                 "Mode", "Eval-only (DFS tree)", "Eval + 256 MiB TT", "Chk");
     std::printf("-----------------------------+--------------------------------+--------------------------------+-----\n");
 
     double ref_eval = 0.0, ref_tt = 0.0;
-    bench_one("1. RAW_NTUPLE_64 (2Bx60)", leaves, tt,
+    bench_one("1. RAW_NTUPLE_64 (PTM 2B)", leaves, tt,
         [&](const uint16_t* idx, int stm, int ply) { return eval_raw_ntuple64(raw, pt.meta, idx, stm, ply); },
         ref_eval, ref_tt);
-    bench_one("2. LINEAR_64 (Asym v1.1)", leaves, tt,
+    bench_one("2. LINEAR_64 (PTM v2.0)", leaves, tt,
         [&](const uint16_t* idx, int stm, int ply) { return evaluate_p2c64<EvalMode::LINEAR_64>(w, pt.meta, idx, stm, ply); },
         ref_eval, ref_tt);
-    bench_one("3. CAND_A_SCRELU_K2 (Fact)", leaves, tt,
-        [&](const uint16_t* idx, int stm, int ply) { return evaluate_p2c64<EvalMode::CAND_A_SCRELU_K2>(w, pt.meta, idx, stm, ply); },
+    bench_one("3. CAND_A_PTM_SCRELU4", leaves, tt,
+        [&](const uint16_t* idx, int stm, int ply) { return evaluate_p2c64<EvalMode::CAND_A_PTM_SCRELU4>(w, pt.meta, idx, stm, ply); },
         ref_eval, ref_tt);
-    bench_one("4. CAND_B_3W3B (Naive)", leaves, tt,
-        [&](const uint16_t* idx, int stm, int ply) { return evaluate_p2c64<EvalMode::CAND_B_SCONED_3W3B_NAIVE>(w, pt.meta, idx, stm, ply); },
+    bench_one("4. CAND_B_PTM_3W3B (Naive)", leaves, tt,
+        [&](const uint16_t* idx, int stm, int ply) { return evaluate_p2c64<EvalMode::CAND_B_PTM_3W3B_NAIVE>(w, pt.meta, idx, stm, ply); },
         ref_eval, ref_tt);
-    bench_one("5. CAND_B_3W3B (Key-14 1st)", leaves, tt,
-        [&](const uint16_t* idx, int stm, int ply) { return evaluate_p2c64<EvalMode::CAND_B_SCONED_3W3B>(w, pt.meta, idx, stm, ply); },
+    bench_one("5. CAND_B_PTM_3W3B (Key14)", leaves, tt,
+        [&](const uint16_t* idx, int stm, int ply) { return evaluate_p2c64<EvalMode::CAND_B_PTM_3W3B>(w, pt.meta, idx, stm, ply); },
         ref_eval, ref_tt);
-    bench_one("6. CAND_C_HYBRID (Fact+LUT)", leaves, tt,
-        [&](const uint16_t* idx, int stm, int ply) { return evaluate_p2c64<EvalMode::CAND_C_HYBRID>(w, pt.meta, idx, stm, ply); },
+    bench_one("6. CAND_C_PTM_HYBRID", leaves, tt,
+        [&](const uint16_t* idx, int stm, int ply) { return evaluate_p2c64<EvalMode::CAND_C_PTM_HYBRID>(w, pt.meta, idx, stm, ply); },
         ref_eval, ref_tt);
 
     std::free(tt);
