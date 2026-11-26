@@ -1,3 +1,13 @@
 build/
 *.o
 *.out
+*.so
+*.p2c
+*.bin
+*.pt
+*.csv
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+smoke_run/
+data/
