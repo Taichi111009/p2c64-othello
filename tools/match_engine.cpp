@@ -152,6 +152,7 @@ static void print_usage(const char* prog) {
     std::printf("  --tt-mb <MB>                  TT size per player in MiB (default: 64)\n");
     std::printf("  --mpc / --no-mpc              Enable/disable standard Multi-ProbCut (default: off)\n");
     std::printf("  --mpc-t <val>                 MPC sigma multiplier (default: 1.80)\n");
+    std::printf("  --mpc-pure-v64 / --no-mpc-pure-v64  Use Tier-1 V1 only on MPC probe leaves (default: off)\n");
     std::printf("  --m25 <discs>                 WACA-G2 Stage 1->2.5 gate margin in discs (default: 2.5)\n");
     std::printf("  --m3 <discs>                  WACA-G2 Stage 2.5->3 gate margin in discs (default: 1.5)\n");
     std::printf("  --gate-mode safe_bnd|fail_hard|full  WACA-G2 gating mode (default: safe_bnd)\n");
@@ -169,6 +170,7 @@ int main(int argc, char** argv) {
     int endgame_empties       = 10;
     size_t tt_mb              = 64;
     bool use_mpc              = false;
+    bool mpc_pure_v64         = false;
     double mpc_t              = 1.80;
     double m25_discs          = 2.5;
     double m3_discs           = 1.5;
@@ -186,6 +188,8 @@ int main(int argc, char** argv) {
         else if (arg == "--tt-mb" && i + 1 < argc)           tt_mb = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
         else if (arg == "--mpc")                             use_mpc = true;
         else if (arg == "--no-mpc")                          use_mpc = false;
+        else if (arg == "--mpc-pure-v64")                    mpc_pure_v64 = true;
+        else if (arg == "--no-mpc-pure-v64")                 mpc_pure_v64 = false;
         else if (arg == "--mpc-t" && i + 1 < argc)           mpc_t = std::atof(argv[++i]);
         else if (arg == "--m25" && i + 1 < argc)             m25_discs = std::atof(argv[++i]);
         else if (arg == "--m3" && i + 1 < argc)              m3_discs = std::atof(argv[++i]);
@@ -223,6 +227,8 @@ int main(int argc, char** argv) {
     PVSEngine eng2(&m2, tt_mb, endgame_empties);
     eng1.set_mpc(use_mpc, mpc_t);
     eng2.set_mpc(use_mpc, mpc_t);
+    eng1.set_mpc_pure_v64(mpc_pure_v64);
+    eng2.set_mpc_pure_v64(mpc_pure_v64);
     eng1.set_waca_gate(gate_mode, m25_discs, m3_discs);
     eng2.set_waca_gate(gate_mode, m25_discs, m3_discs);
 
@@ -236,10 +242,11 @@ int main(int argc, char** argv) {
     std::printf("=== P2C-64 Pure-Scalar PVS Paired Match Engine ===\n");
     std::printf("P1 (%s): %s\n", eval_mode_name(m1.mode), p1_path.c_str());
     std::printf("P2 (%s): %s\n", eval_mode_name(m2.mode), p2_path.c_str());
-    std::printf("Config: mode=%s limit=%lld | pairs=%d (%d games) | open=%d ply | endgame=%d empties | TT=%zu MiB | MPC=%s(t=%.2f) | gate=%s(m25=%.2f,m3=%.2f)\n",
+    std::printf("Config: mode=%s limit=%lld | pairs=%d (%d games) | open=%d ply | endgame=%d empties | TT=%zu MiB | MPC=%s(t=%.2f) | mpc_pure_v64=%s | gate=%s(m25=%.2f,m3=%.2f)\n",
                 mode_str.c_str(), static_cast<long long>(limit_val), num_pairs, num_pairs * 2,
                 opening_plies, endgame_empties, tt_mb,
-                use_mpc ? "ON" : "OFF", mpc_t, gate_mode_name(gate_mode), m25_discs, m3_discs);
+                use_mpc ? "ON" : "OFF", mpc_t, mpc_pure_v64 ? "ON" : "OFF",
+                gate_mode_name(gate_mode), m25_discs, m3_discs);
 
     for (int i = 0; i < num_pairs; ++i) {
         int d1 = play_game(openings[static_cast<size_t>(i)], eng1, eng2, st1, st2, mode, limit_val);
@@ -277,12 +284,14 @@ int main(int argc, char** argv) {
     double nps2 = (st2.total_ms > 0.0) ? (static_cast<double>(st2.total_nodes) / (st2.total_ms * 1e-3)) : 0.0;
     double avg_d1 = st1.move_count ? static_cast<double>(st1.total_depth) / st1.move_count : 0.0;
     double avg_d2 = st2.move_count ? static_cast<double>(st2.total_depth) / st2.move_count : 0.0;
-    double p1_s25 = st1.total_main_leaves ? (100.0 * st1.total_s25_runs / st1.total_main_leaves) : 0.0;
-    double p1_s3  = st1.total_main_leaves ? (100.0 * st1.total_s3_runs  / st1.total_main_leaves) : 0.0;
-    double p1_mpc = st1.total_mpc_tries   ? (100.0 * st1.total_mpc_cuts / st1.total_mpc_tries)   : 0.0;
-    double p2_s25 = st2.total_main_leaves ? (100.0 * st2.total_s25_runs / st2.total_main_leaves) : 0.0;
-    double p2_s3  = st2.total_main_leaves ? (100.0 * st2.total_s3_runs  / st2.total_main_leaves) : 0.0;
-    double p2_mpc = st2.total_mpc_tries   ? (100.0 * st2.total_mpc_cuts / st2.total_mpc_tries)   : 0.0;
+    const uint64_t p1_eval_leaves = mpc_pure_v64 ? st1.total_main_leaves : (st1.total_main_leaves + st1.total_mpc_leaves);
+    const uint64_t p2_eval_leaves = mpc_pure_v64 ? st2.total_main_leaves : (st2.total_main_leaves + st2.total_mpc_leaves);
+    double p1_s25 = p1_eval_leaves ? (100.0 * st1.total_s25_runs / p1_eval_leaves) : 0.0;
+    double p1_s3  = p1_eval_leaves ? (100.0 * st1.total_s3_runs  / p1_eval_leaves) : 0.0;
+    double p1_mpc = st1.total_mpc_tries ? (100.0 * st1.total_mpc_cuts / st1.total_mpc_tries) : 0.0;
+    double p2_s25 = p2_eval_leaves ? (100.0 * st2.total_s25_runs / p2_eval_leaves) : 0.0;
+    double p2_s3  = p2_eval_leaves ? (100.0 * st2.total_s3_runs  / p2_eval_leaves) : 0.0;
+    double p2_mpc = st2.total_mpc_tries ? (100.0 * st2.total_mpc_cuts / st2.total_mpc_tries) : 0.0;
 
     std::printf("\n--- Match Summary (P1 vs P2) ---\n");
     std::printf("Result (W-D-L) : %d - %d - %d (WinRate: %.2f%%)\n", wins, draws, losses, win_rate * 100.0);
@@ -302,7 +311,7 @@ int main(int argc, char** argv) {
         std::ofstream ofs(csv_path, std::ios::app);
         if (ofs) {
             if (!exists) {
-                ofs << "p1_mode,p2_mode,mode,limit,mpc,gate_mode,m25,m3,games,wins,draws,losses,win_rate,elo,elo_ci95,avg_disc_diff,p1_knps,p2_knps,p1_depth,p2_depth,p1_s25_pct,p1_s3_pct,p1_mpc_cut_pct,p2_mpc_cut_pct\n";
+                ofs << "p1_mode,p2_mode,mode,limit,mpc,gate_mode,m25,m3,games,wins,draws,losses,win_rate,elo,elo_ci95,avg_disc_diff,p1_knps,p2_knps,p1_depth,p2_depth,p1_s25_pct,p1_s3_pct,p1_mpc_cut_pct,p2_mpc_cut_pct,mpc_pure_v64\n";
             }
             ofs << eval_mode_name(m1.mode) << "," << eval_mode_name(m2.mode) << ","
                 << mode_str << "," << limit_val << "," << (use_mpc ? 1 : 0) << ","
@@ -310,7 +319,8 @@ int main(int argc, char** argv) {
                 << total_games << "," << wins << "," << draws << "," << losses << ","
                 << win_rate << "," << elo_mid << "," << elo_err << "," << avg_diff << ","
                 << (nps1 * 1e-3) << "," << (nps2 * 1e-3) << "," << avg_d1 << "," << avg_d2 << ","
-                << p1_s25 << "," << p1_s3 << "," << p1_mpc << "," << p2_mpc << "\n";
+                << p1_s25 << "," << p1_s3 << "," << p1_mpc << "," << p2_mpc << ","
+                << (mpc_pure_v64 ? 1 : 0) << "\n";
         }
     }
     return 0;

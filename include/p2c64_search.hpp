@@ -116,6 +116,7 @@ public:
     // Standard Multi-ProbCut & WACA-G2 2-stage gating parameters (100% fair across models!)
     bool     use_mpc_         = false;
     double   mpc_t_           = 1.80;
+    bool     mpc_pure_v64_    = false; // Default OFF: fair gated WACA_G2 + TT write on MPC probes!
     GateMode gate_mode_       = GateMode::SAFE_BND;
     int32_t  m25_units_       = 320; // 2.5 discs * 128
     int32_t  m3_units_        = 192; // 1.5 discs * 128
@@ -143,6 +144,10 @@ public:
     void set_mpc(bool enable, double t_val = 1.80) noexcept {
         use_mpc_ = enable;
         mpc_t_   = t_val;
+    }
+
+    void set_mpc_pure_v64(bool enable) noexcept {
+        mpc_pure_v64_ = enable;
     }
 
     void set_waca_gate(GateMode gm, double m25_discs, double m3_discs) noexcept {
@@ -334,7 +339,7 @@ public:
             if (in_mpc_probe) stat_mpc_leaves_++;
             else              stat_main_leaves_++;
             return model_->evaluate_search(pt_.meta, idx, B, W, stm, ply, alpha, beta,
-                                           in_mpc_probe, gate_mode_, m25_units_, m3_units_,
+                                           (in_mpc_probe && mpc_pure_v64_), gate_mode_, m25_units_, m3_units_,
                                            stat_s25_runs_, stat_s3_runs_);
         }
 
@@ -483,7 +488,7 @@ public:
         }
 
         if (!aborted_) {
-            if (!(in_mpc_probe && model_->is_waca)) {
+            if (!(in_mpc_probe && model_->is_waca && mpc_pure_v64_)) {
                 SearchTTEntry& e = tt_[hash & tt_mask_];
                 if (e.flag == TT_NONE || e.gen != tt_gen_ || e.depth <= depth) {
                     e.key       = hash;
@@ -615,11 +620,14 @@ public:
         tt_gen_ = static_cast<uint8_t>((tt_gen_ + 1) & 0xFFU);
         if (tt_gen_ == 0) tt_gen_ = 1;
         nodes_ = 0; node_limit_ = 0; use_time_limit_ = false; aborted_ = false;
-        const bool saved_mpc = use_mpc_;
+        const bool saved_mpc  = use_mpc_;
+        const bool saved_pure = mpc_pure_v64_;
         use_mpc_ = false;
+        if (tier1_only) mpc_pure_v64_ = true;
         int32_t sc = pvs_midgame(B, W, stm, ply, depth, hash, root_idx,
                                  -SEARCH_INF, SEARCH_INF, false, nullptr, tier1_only);
-        use_mpc_ = saved_mpc;
+        use_mpc_      = saved_mpc;
+        mpc_pure_v64_ = saved_pure;
         return sc;
     }
 };
