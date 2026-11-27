@@ -419,6 +419,7 @@ static inline uint64_t calc_flips(int sq, uint64_t P, uint64_t O) noexcept {
 // ============================================================================
 // Pure-Scalar Bitboard Feature Primitives for WACA-G2 (Zero SIMD, Strict D4)
 // ============================================================================
+__attribute__((always_inline))
 static inline uint64_t ks_moves_dir_l(uint64_t P, uint64_t mO, uint64_t E, int d) noexcept {
     uint64_t f  = mO & (P << d);
     f          |= mO & (f << d);
@@ -428,6 +429,7 @@ static inline uint64_t ks_moves_dir_l(uint64_t P, uint64_t mO, uint64_t E, int d
     return E & (f << d);
 }
 
+__attribute__((always_inline))
 static inline uint64_t ks_moves_dir_r(uint64_t P, uint64_t mO, uint64_t E, int d) noexcept {
     uint64_t f  = mO & (P >> d);
     f          |= mO & (f >> d);
@@ -438,6 +440,7 @@ static inline uint64_t ks_moves_dir_r(uint64_t P, uint64_t mO, uint64_t E, int d
 }
 
 // Interleaved Kogge-Stone legal move generation for BOTH sides (maximizes scalar OoO ILP)
+__attribute__((always_inline))
 static inline void generate_moves_pair(uint64_t P, uint64_t O,
                                        uint64_t& out_mvP, uint64_t& out_mvO) noexcept {
     const uint64_t E  = ~(P | O);

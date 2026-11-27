@@ -60,19 +60,21 @@ static void print_usage(const char* prog) {
     std::printf("  --tt-mb <MB>     TT size in MiB (default: 64)\n");
     std::printf("  --m25 <discs>    WACA-G2 m25 gate margin (default: 2.5)\n");
     std::printf("  --m3 <discs>     WACA-G2 m3 gate margin (default: 1.5)\n");
-    std::printf("  --gate-mode <m>  safe_bnd|fail_hard|full (default: safe_bnd)\n");
+    std::printf("  --tt-guard <d>   WIDE_SAFE_BND TT safety margin (default: 4.5)\n");
+    std::printf("  --gate-mode <m>  safe_bnd|fail_hard|full|wide_safe_bnd (default: safe_bnd)\n");
     std::printf("  --csv <path>     Write MPC sigma comparison CSV\n");
 }
 
 int main(int argc, char** argv) {
     std::string data_path, csv_path, gate_mode_str = "safe_bnd";
     std::vector<std::string> model_paths;
-    size_t num_pos = 2000;
-    int d_shallow  = 2;
-    int d_deep     = 6;
-    size_t tt_mb   = 64;
-    double m25_d   = 2.5;
-    double m3_d    = 1.5;
+    size_t num_pos    = 2000;
+    int d_shallow     = 2;
+    int d_deep        = 6;
+    size_t tt_mb      = 64;
+    double m25_d      = 2.5;
+    double m3_d       = 1.5;
+    double tt_guard_d = 4.5;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -83,6 +85,7 @@ int main(int argc, char** argv) {
         else if (arg == "--tt-mb" && i + 1 < argc)     tt_mb = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
         else if (arg == "--m25" && i + 1 < argc)       m25_d = std::atof(argv[++i]);
         else if (arg == "--m3" && i + 1 < argc)        m3_d = std::atof(argv[++i]);
+        else if (arg == "--tt-guard" && i + 1 < argc)  tt_guard_d = std::atof(argv[++i]);
         else if (arg == "--gate-mode" && i + 1 < argc) gate_mode_str = argv[++i];
         else if (arg == "--csv" && i + 1 < argc)       csv_path = argv[++i];
         else if (arg == "--models") {
@@ -102,6 +105,7 @@ int main(int argc, char** argv) {
     GateMode gm = GateMode::SAFE_BND;
     if (gate_mode_str == "fail_hard") gm = GateMode::FAIL_HARD;
     else if (gate_mode_str == "full") gm = GateMode::FULL;
+    else if (gate_mode_str == "wide_safe_bnd") gm = GateMode::WIDE_SAFE_BND;
 
     std::ifstream ifs(data_path, std::ios::binary | std::ios::ate);
     if (!ifs) { std::fprintf(stderr, "ERROR: Cannot open '%s'\n", data_path.c_str()); return 1; }
@@ -163,13 +167,13 @@ int main(int argc, char** argv) {
             return 1;
         }
         PVSEngine eng(&m, tt_mb, 0);
-        eng.set_waca_gate(gm, m25_d, m3_d);
+        eng.set_waca_gate(gm, m25_d, m3_d, tt_guard_d);
         const double inv_scale = 1.0 / static_cast<double>(m.score_scale);
 
         std::vector<double> ax, ay, ax_v1;
         std::vector<double> bx[3], by[3], bx_v1[3];
         ax.reserve(samples.size()); ay.reserve(samples.size());
-        if (m.is_waca) ax_v1.reserve(samples.size());
+        if (m.is_any_waca()) ax_v1.reserve(samples.size());
 
         for (const auto& s : samples) {
             if (s.ply > 59) continue;
@@ -187,7 +191,7 @@ int main(int argc, char** argv) {
             bx[bkt].push_back(vs);
             by[bkt].push_back(vd);
 
-            if (m.is_waca) {
+            if (m.is_any_waca()) {
                 eng.clear_tt();
                 double vs_v1 = static_cast<double>(eng.eval_fixed_depth(s.black, s.white, s.stm, d_shallow, true)) * inv_scale;
                 ax_v1.push_back(vs_v1);
@@ -196,8 +200,9 @@ int main(int argc, char** argv) {
         }
 
         emit_row(mp, eval_mode_name(m.mode), ax, ay, bx, by);
-        if (m.is_waca) {
-            emit_row(mp, "WACA_G2[MPC-PureV64:V1->G2]", ax_v1, ay, bx_v1, by);
+        if (m.is_any_waca()) {
+            std::string pure_lbl = std::string(eval_mode_name(m.mode)) + "[V1->Full]";
+            emit_row(mp, pure_lbl, ax_v1, ay, bx_v1, by);
         }
     }
     return 0;

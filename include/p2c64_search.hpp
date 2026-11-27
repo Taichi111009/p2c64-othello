@@ -120,6 +120,7 @@ public:
     GateMode gate_mode_       = GateMode::SAFE_BND;
     int32_t  m25_units_       = 320; // 2.5 discs * 128
     int32_t  m3_units_        = 192; // 1.5 discs * 128
+    int32_t  tt_guard_units_  = 576; // 4.5 discs * 128 (used by GateMode::WIDE_SAFE_BND)
 
     // Runtime limits & counters
     uint64_t nodes_           = 0;
@@ -150,11 +151,12 @@ public:
         mpc_pure_v64_ = enable;
     }
 
-    void set_waca_gate(GateMode gm, double m25_discs, double m3_discs) noexcept {
-        gate_mode_ = gm;
+    void set_waca_gate(GateMode gm, double m25_discs, double m3_discs, double tt_guard_discs = 4.5) noexcept {
+        gate_mode_      = gm;
         const double sc = static_cast<double>(model_->score_scale);
-        m25_units_ = static_cast<int32_t>(m25_discs * sc + 0.5);
-        m3_units_  = static_cast<int32_t>(m3_discs * sc + 0.5);
+        m25_units_      = static_cast<int32_t>(m25_discs * sc + 0.5);
+        m3_units_       = static_cast<int32_t>(m3_discs * sc + 0.5);
+        tt_guard_units_ = static_cast<int32_t>(tt_guard_discs * sc + 0.5);
     }
 
     static inline double mpc_sigma_discs(int d_sh, int ply) noexcept {
@@ -340,7 +342,7 @@ public:
             else              stat_main_leaves_++;
             return model_->evaluate_search(pt_.meta, idx, B, W, stm, ply, alpha, beta,
                                            (in_mpc_probe && mpc_pure_v64_), gate_mode_, m25_units_, m3_units_,
-                                           stat_s25_runs_, stat_s3_runs_);
+                                           stat_s25_runs_, stat_s3_runs_, tt_guard_units_);
         }
 
         uint8_t tt_move = 64;
@@ -488,7 +490,7 @@ public:
         }
 
         if (!aborted_) {
-            if (!(in_mpc_probe && model_->is_waca && mpc_pure_v64_)) {
+            if (!(in_mpc_probe && model_->is_any_waca() && mpc_pure_v64_)) {
                 SearchTTEntry& e = tt_[hash & tt_mask_];
                 if (e.flag == TT_NONE || e.gen != tt_gen_ || e.depth <= depth) {
                     e.key       = hash;

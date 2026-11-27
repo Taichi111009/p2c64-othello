@@ -135,9 +135,10 @@ static double prob_to_elo(double p) {
 
 static const char* gate_mode_name(GateMode gm) noexcept {
     switch (gm) {
-        case GateMode::SAFE_BND:  return "safe_bnd";
-        case GateMode::FAIL_HARD: return "fail_hard";
-        case GateMode::FULL:      return "full";
+        case GateMode::SAFE_BND:      return "safe_bnd";
+        case GateMode::FAIL_HARD:     return "fail_hard";
+        case GateMode::FULL:          return "full";
+        case GateMode::WIDE_SAFE_BND: return "wide_safe_bnd";
     }
     return "safe_bnd";
 }
@@ -155,7 +156,8 @@ static void print_usage(const char* prog) {
     std::printf("  --mpc-pure-v64 / --no-mpc-pure-v64  Use Tier-1 V1 only on MPC probe leaves (default: off)\n");
     std::printf("  --m25 <discs>                 WACA-G2 Stage 1->2.5 gate margin in discs (default: 2.5)\n");
     std::printf("  --m3 <discs>                  WACA-G2 Stage 2.5->3 gate margin in discs (default: 1.5)\n");
-    std::printf("  --gate-mode safe_bnd|fail_hard|full  WACA-G2 gating mode (default: safe_bnd)\n");
+    std::printf("  --tt-guard <discs>            WIDE_SAFE_BND TT safety margin in discs (default: 4.5)\n");
+    std::printf("  --gate-mode safe_bnd|fail_hard|full|wide_safe_bnd  WACA-G2 gating mode (default: safe_bnd)\n");
     std::printf("  --seed <S>                    Opening RNG seed (default: 20261125)\n");
     std::printf("  --csv <path>                  Append summary row to CSV file\n");
 }
@@ -174,6 +176,7 @@ int main(int argc, char** argv) {
     double mpc_t              = 1.80;
     double m25_discs          = 2.5;
     double m3_discs           = 1.5;
+    double tt_guard_discs     = 4.5;
     uint64_t seed             = 20261125ULL;
 
     for (int i = 1; i < argc; ++i) {
@@ -193,6 +196,7 @@ int main(int argc, char** argv) {
         else if (arg == "--mpc-t" && i + 1 < argc)           mpc_t = std::atof(argv[++i]);
         else if (arg == "--m25" && i + 1 < argc)             m25_discs = std::atof(argv[++i]);
         else if (arg == "--m3" && i + 1 < argc)              m3_discs = std::atof(argv[++i]);
+        else if (arg == "--tt-guard" && i + 1 < argc)        tt_guard_discs = std::atof(argv[++i]);
         else if (arg == "--gate-mode" && i + 1 < argc)       gate_mode_str = argv[++i];
         else if (arg == "--seed" && i + 1 < argc)            seed = static_cast<uint64_t>(std::strtoull(argv[++i], nullptr, 10));
         else if (arg == "--csv" && i + 1 < argc)             csv_path = argv[++i];
@@ -213,9 +217,10 @@ int main(int argc, char** argv) {
     else { std::fprintf(stderr, "ERROR: Invalid --mode '%s'\n", mode_str.c_str()); return 1; }
 
     GateMode gate_mode = GateMode::SAFE_BND;
-    if (gate_mode_str == "safe_bnd")       gate_mode = GateMode::SAFE_BND;
-    else if (gate_mode_str == "fail_hard") gate_mode = GateMode::FAIL_HARD;
-    else if (gate_mode_str == "full")      gate_mode = GateMode::FULL;
+    if (gate_mode_str == "safe_bnd")           gate_mode = GateMode::SAFE_BND;
+    else if (gate_mode_str == "fail_hard")     gate_mode = GateMode::FAIL_HARD;
+    else if (gate_mode_str == "full")          gate_mode = GateMode::FULL;
+    else if (gate_mode_str == "wide_safe_bnd") gate_mode = GateMode::WIDE_SAFE_BND;
     else { std::fprintf(stderr, "ERROR: Invalid --gate-mode '%s'\n", gate_mode_str.c_str()); return 1; }
 
     LoadedModel m1, m2;
@@ -229,8 +234,8 @@ int main(int argc, char** argv) {
     eng2.set_mpc(use_mpc, mpc_t);
     eng1.set_mpc_pure_v64(mpc_pure_v64);
     eng2.set_mpc_pure_v64(mpc_pure_v64);
-    eng1.set_waca_gate(gate_mode, m25_discs, m3_discs);
-    eng2.set_waca_gate(gate_mode, m25_discs, m3_discs);
+    eng1.set_waca_gate(gate_mode, m25_discs, m3_discs, tt_guard_discs);
+    eng2.set_waca_gate(gate_mode, m25_discs, m3_discs, tt_guard_discs);
 
     auto openings = generate_openings(num_pairs, opening_plies, seed);
 
@@ -242,11 +247,11 @@ int main(int argc, char** argv) {
     std::printf("=== P2C-64 Pure-Scalar PVS Paired Match Engine ===\n");
     std::printf("P1 (%s): %s\n", eval_mode_name(m1.mode), p1_path.c_str());
     std::printf("P2 (%s): %s\n", eval_mode_name(m2.mode), p2_path.c_str());
-    std::printf("Config: mode=%s limit=%lld | pairs=%d (%d games) | open=%d ply | endgame=%d empties | TT=%zu MiB | MPC=%s(t=%.2f) | mpc_pure_v64=%s | gate=%s(m25=%.2f,m3=%.2f)\n",
+    std::printf("Config: mode=%s limit=%lld | pairs=%d (%d games) | open=%d ply | endgame=%d empties | TT=%zu MiB | MPC=%s(t=%.2f) | mpc_pure_v64=%s | gate=%s(m25=%.2f,m3=%.2f,tt_guard=%.2f)\n",
                 mode_str.c_str(), static_cast<long long>(limit_val), num_pairs, num_pairs * 2,
                 opening_plies, endgame_empties, tt_mb,
                 use_mpc ? "ON" : "OFF", mpc_t, mpc_pure_v64 ? "ON" : "OFF",
-                gate_mode_name(gate_mode), m25_discs, m3_discs);
+                gate_mode_name(gate_mode), m25_discs, m3_discs, tt_guard_discs);
 
     for (int i = 0; i < num_pairs; ++i) {
         int d1 = play_game(openings[static_cast<size_t>(i)], eng1, eng2, st1, st2, mode, limit_val);
@@ -311,7 +316,7 @@ int main(int argc, char** argv) {
         std::ofstream ofs(csv_path, std::ios::app);
         if (ofs) {
             if (!exists) {
-                ofs << "p1_mode,p2_mode,mode,limit,mpc,gate_mode,m25,m3,games,wins,draws,losses,win_rate,elo,elo_ci95,avg_disc_diff,p1_knps,p2_knps,p1_depth,p2_depth,p1_s25_pct,p1_s3_pct,p1_mpc_cut_pct,p2_mpc_cut_pct,mpc_pure_v64\n";
+                ofs << "p1_mode,p2_mode,mode,limit,mpc,gate_mode,m25,m3,games,wins,draws,losses,win_rate,elo,elo_ci95,avg_disc_diff,p1_knps,p2_knps,p1_depth,p2_depth,p1_s25_pct,p1_s3_pct,p1_mpc_cut_pct,p2_mpc_cut_pct,mpc_pure_v64,tt_guard\n";
             }
             ofs << eval_mode_name(m1.mode) << "," << eval_mode_name(m2.mode) << ","
                 << mode_str << "," << limit_val << "," << (use_mpc ? 1 : 0) << ","
@@ -320,7 +325,7 @@ int main(int argc, char** argv) {
                 << win_rate << "," << elo_mid << "," << elo_err << "," << avg_diff << ","
                 << (nps1 * 1e-3) << "," << (nps2 * 1e-3) << "," << avg_d1 << "," << avg_d2 << ","
                 << p1_s25 << "," << p1_s3 << "," << p1_mpc << "," << p2_mpc << ","
-                << (mpc_pure_v64 ? 1 : 0) << "\n";
+                << (mpc_pure_v64 ? 1 : 0) << "," << tt_guard_discs << "\n";
         }
     }
     return 0;

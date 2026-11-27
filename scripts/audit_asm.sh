@@ -28,19 +28,29 @@ targets = [
     ("CAND_B_KEY14 [W]",      r"<int p2c64::evaluate_p2c64_ptm<\(p2c64::EvalMode\)4, true>\([^>]*>:\n(.*?)(?:\n\n|\Z)",  0),
     ("CAND_C_HYBRID [B]",     r"<int p2c64::evaluate_p2c64_ptm<\(p2c64::EvalMode\)5, false>\([^>]*>:\n(.*?)(?:\n\n|\Z)", 22),
     ("CAND_C_HYBRID [W]",     r"<int p2c64::evaluate_p2c64_ptm<\(p2c64::EvalMode\)5, true>\([^>]*>:\n(.*?)(?:\n\n|\Z)",  22),
-    ("WACA_G2 Stage1 [B]",    r"<int p2c64::eval_waca_stage1_ptm<false>\([^>]*>:\n(.*?)(?:\n\n|\Z)", 0),
-    ("WACA_G2 Stage1 [W]",    r"<int p2c64::eval_waca_stage1_ptm<true>\([^>]*>:\n(.*?)(?:\n\n|\Z)",  0),
-    ("WACA_G2 Stage2.5",      r"<(?:int )?p2c64::eval_waca_stage25_kernel\([^>]*>:\n(.*?)(?:\n\n|\Z)", 36),
-    ("WACA_G2 Stage3 [B]",    r"<int p2c64::eval_waca_stage3_ptm<false>\([^>]*>:\n(.*?)(?:\n\n|\Z)", 128),
-    ("WACA_G2 Stage3 [W]",    r"<int p2c64::eval_waca_stage3_ptm<true>\([^>]*>:\n(.*?)(?:\n\n|\Z)",  128),
+    ("WACA_G2 Stage1 [B]",    r"<int p2c64::eval_waca_stage1_ptm<false>\([^>]*>:\n(.*?)(?:\n\n|\Z)", 0, False),
+    ("WACA_G2 Stage1 [W]",    r"<int p2c64::eval_waca_stage1_ptm<true>\([^>]*>:\n(.*?)(?:\n\n|\Z)",  0, False),
+    ("WACA_G2 Stage2.5",      r"<(?:int )?p2c64::eval_waca_stage25_kernel\([^>]*>:\n(.*?)(?:\n\n|\Z)", 36, True),
+    ("WACA_G2 Stage3 [B]",    r"<int p2c64::eval_waca_stage3_ptm<false>\([^>]*>:\n(.*?)(?:\n\n|\Z)", 128, False),
+    ("WACA_G2 Stage3 [W]",    r"<int p2c64::eval_waca_stage3_ptm<true>\([^>]*>:\n(.*?)(?:\n\n|\Z)",  128, False),
+    ("WACA_V31 Stage1 [B]",   r"<int p2c64::eval_waca_v31_stage1_ptm<false>\([^>]*>:\n(.*?)(?:\n\n|\Z)", 0, False),
+    ("WACA_V31 Stage1 [W]",   r"<int p2c64::eval_waca_v31_stage1_ptm<true>\([^>]*>:\n(.*?)(?:\n\n|\Z)",  0, False),
+    ("WACA_V31 Stage2.5",     r"<(?:int )?p2c64::eval_waca_v31_stage25_kernel\([^>]*>:\n(.*?)(?:\n\n|\Z)", 16, True),
+    ("WACA_V31 Stage3 [B]",   r"<int p2c64::eval_waca_v31_stage3_ptm<false>\([^>]*>:\n(.*?)(?:\n\n|\Z)", 160, False),
+    ("WACA_V31 Stage3 [W]",   r"<int p2c64::eval_waca_v31_stage3_ptm<true>\([^>]*>:\n(.*?)(?:\n\n|\Z)",  160, False),
 ]
 
-print("=== P2C-64 v3.0 Pure-Scalar Assembly Audit (objdump -d -C, Black [B] & White [W]) ===")
-print(f"{'Kernel':<22} | {'Insns':>6} | {'imul':>5} | {'div':>4} | {'xmm/ymm/zmm':>11} | Status")
-print("-" * 74)
+print("=== P2C-64 v3.1 Pure-Scalar Assembly Audit (objdump -d -C, Black [B] & White [W]) ===")
+print(f"{'Kernel':<22} | {'Insns':>6} | {'imul':>5} | {'div':>4} | {'calls':>5} | {'xmm/ymm/zmm':>11} | Status")
+print("-" * 82)
 
 failed = False
-for name, pattern, max_imul in targets:
+for item in targets:
+    if len(item) == 3:
+        name, pattern, max_imul = item
+        forbid_calls = False
+    else:
+        name, pattern, max_imul, forbid_calls = item
     m = re.search(pattern, asm, re.S)
     if not m:
         print(f"{name:<22} | NOT FOUND IN BINARY")
@@ -50,6 +60,8 @@ for name, pattern, max_imul in targets:
     insns = len(lines)
     imuls = sum(1 for l in lines if re.search(r"\b(imul|mul)\b", l.split("\t")[-1]))
     divs  = sum(1 for l in lines if re.search(r"\b(idiv|div)\b", l.split("\t")[-1]))
+    pop_plt = sum(1 for l in lines if "__popcountdi2" in l)
+    calls = sum(1 for l in lines if re.search(r"\bcall\b", l.split("\t")[-1]) and "__stack_chk_fail" not in l)
     simd  = sum(1 for l in lines if re.search(r"%[xyz]mm\d+", l.split("\t")[-1]))
     avx   = sum(1 for l in lines if re.search(r"%[yz]mm\d+", l.split("\t")[-1]))
 
@@ -57,13 +69,16 @@ for name, pattern, max_imul in targets:
     if avx > 0 or simd > 0:
         status = f"FAIL (expected 0 simd, got {simd})"
         failed = True
+    elif forbid_calls and (pop_plt > 0 or calls > 0):
+        status = f"FAIL (expected 0 calls/popcnt_plt, got calls={calls} pop_plt={pop_plt})"
+        failed = True
     elif imuls > max_imul:
         status = f"FAIL (expected <={max_imul} imul, got {imuls})"
         failed = True
 
-    print(f"{name:<22} | {insns:6d} | {imuls:5d} | {divs:4d} | {simd:11d} | {status}")
+    print(f"{name:<22} | {insns:6d} | {imuls:5d} | {divs:4d} | {calls:5d} | {simd:11d} | {status}")
 
 if failed:
     sys.exit(1)
-print("\n[PASS] Assembly audit verified: 0 SIMD/AVX across all 17 v2.0 + v3.0 WACA-G2 kernels!")
+print(f"\n[PASS] Assembly audit verified: 0 SIMD/AVX across all {len(targets)} v2.0 + v3.0 + v3.1 kernels (0 PLT calls in Stage 2.5)!")
 PYEOF

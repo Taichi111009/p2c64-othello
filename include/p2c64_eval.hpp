@@ -49,7 +49,8 @@ enum class EvalMode : int {
     CAND_B_PTM_3W3B_NAIVE = 3,
     CAND_B_PTM_3W3B       = 4,
     CAND_C_PTM_HYBRID     = 5,
-    WACA_G2               = 6
+    WACA_G2               = 6,
+    WACA_G2_V31           = 7
 };
 
 // ============================================================================
@@ -641,9 +642,10 @@ static inline constexpr int32_t abs_i32(int32_t x) noexcept {
 }
 
 enum class GateMode : int {
-    SAFE_BND  = 0, // Return shrunk-margin sound bound (V1+M25 / V1-M25) -> 0 TT pollution
-    FAIL_HARD = 1, // Return alpha / beta directly
-    FULL      = 2  // Disable leaf gating (100% Stage 3 on non-MPC leaves)
+    SAFE_BND      = 0, // Return shrunk-margin sound bound (V+M / V-M)
+    FAIL_HARD     = 1, // Return alpha / beta directly
+    FULL          = 2, // Disable leaf gating (100% Stage 3 on non-MPC leaves)
+    WIDE_SAFE_BND = 3  // Separate gate margin (M) from wide TT safety guard (std::min(alpha, V+G))
 };
 
 struct alignas(64) WacaStage25Ply {
@@ -1016,7 +1018,21 @@ inline int32_t eval_waca_g2_full(const WacaG2Weights& w,
     return v3;
 }
 
-// Search-integrated 2-stage SAFE_BND / FAIL_HARD / FULL gated evaluator (with MPC-PureV64!)
+static inline constexpr int32_t gate_return_low(GateMode gm, int32_t v, int32_t m_units,
+                                                int32_t tt_guard_units, int32_t alpha) noexcept {
+    if (gm == GateMode::SAFE_BND)      return v + m_units;
+    if (gm == GateMode::WIDE_SAFE_BND) return std::min(alpha, v + tt_guard_units);
+    return alpha;
+}
+
+static inline constexpr int32_t gate_return_high(GateMode gm, int32_t v, int32_t m_units,
+                                                 int32_t tt_guard_units, int32_t beta) noexcept {
+    if (gm == GateMode::SAFE_BND)      return v - m_units;
+    if (gm == GateMode::WIDE_SAFE_BND) return std::max(beta, v - tt_guard_units);
+    return beta;
+}
+
+// Search-integrated 2-stage SAFE_BND / FAIL_HARD / FULL / WIDE_SAFE_BND gated evaluator (v3.0)
 inline int32_t eval_waca_g2_gated(const WacaG2Weights& w,
                                   const PatternMeta* __restrict meta,
                                   const uint16_t* __restrict idx,
@@ -1027,22 +1043,19 @@ inline int32_t eval_waca_g2_gated(const WacaG2Weights& w,
                                   int32_t m25_units,
                                   int32_t m3_units,
                                   uint64_t& stat_s25,
-                                  uint64_t& stat_s3) noexcept {
+                                  uint64_t& stat_s3,
+                                  int32_t tt_guard_units = 576) noexcept {
     const bool is_w = (stm < 0);
     const int32_t v1 = is_w ? eval_waca_stage1_ptm<true>(w.tier1, meta, idx, ply)
                             : eval_waca_stage1_ptm<false>(w.tier1, meta, idx, ply);
 
-    // MPC-PureV64: unconditionally return exact Stage-1 V1 during shallow MPC probe!
+    // MPC-PureV64: unconditionally return exact Stage-1 V1 during shallow MPC probe when enabled!
     if (in_mpc_probe) return v1;
 
     const bool is_pv = (beta > alpha + 1);
     if (!is_pv && gate_mode != GateMode::FULL) {
-        if (v1 + m25_units <= alpha) {
-            return (gate_mode == GateMode::SAFE_BND) ? (v1 + m25_units) : alpha;
-        }
-        if (v1 - m25_units >= beta) {
-            return (gate_mode == GateMode::SAFE_BND) ? (v1 - m25_units) : beta;
-        }
+        if (v1 + m25_units <= alpha) return gate_return_low(gate_mode, v1, m25_units, tt_guard_units, alpha);
+        if (v1 - m25_units >= beta)  return gate_return_high(gate_mode, v1, m25_units, tt_guard_units, beta);
     }
 
     // Stage 2.5 (~14-16% of main-search leaves + PV)
@@ -1056,18 +1069,539 @@ inline int32_t eval_waca_g2_gated(const WacaG2Weights& w,
     const int32_t v25 = v1 + r25;
 
     if (!is_pv && gate_mode != GateMode::FULL) {
-        if (v25 + m3_units <= alpha) {
-            return (gate_mode == GateMode::SAFE_BND) ? (v25 + m3_units) : alpha;
-        }
-        if (v25 - m3_units >= beta) {
-            return (gate_mode == GateMode::SAFE_BND) ? (v25 - m3_units) : beta;
-        }
+        if (v25 + m3_units <= alpha) return gate_return_low(gate_mode, v25, m3_units, tt_guard_units, alpha);
+        if (v25 - m3_units >= beta)  return gate_return_high(gate_mode, v25, m3_units, tt_guard_units, beta);
     }
 
     // Stage 3 (~4.5-6.0% of main-search leaves + PV)
     stat_s3++;
     const int32_t rt = is_w ? eval_waca_stage3_ptm<true>(w, meta, idx, P, O, c, e, f25, r25, ply)
                             : eval_waca_stage3_ptm<false>(w, meta, idx, P, O, c, e, f25, r25, ply);
+    return v1 + rt;
+}
+
+// ============================================================================
+// P2C-64 v3.1: WACA_G2_V31 (Slim 8-Dim Stage 2.5 + 32-Dim Long-Term Stage 3
+//   with 4-Neighbor Empty Parity & 5-Zone 64-Pat Decomposition + 30-Blk EO Key-14)
+// ============================================================================
+static constexpr int WACA_V31_EO_BLOCKS = 30; // 15 x 2 (even/odd ply parity, max +/-1 ply drift!)
+static constexpr int WACA_V31_F25       = 8;  // Ultra-light Stage 2.5 input dims (3 SWAR popcounts, 8 imul!)
+static constexpr int WACA_V31_F3_EXTRA  = 20; // Stage 3 extra bitboard + parity + 5-zone features f[8..27]
+static constexpr int WACA_V31_F3        = 32; // Stage 3 total MLP input dims (8 + 20 + 4 Key-14 SCReLU)
+static constexpr int WACA_V31_MAX_HID   = 24; // 16 (fast default) or 24
+
+static constexpr std::array<uint8_t, NUM_PLIES> PLY_TO_EO30_BLK = {
+     0, 1, 0, 1,   2, 3, 2, 3,   4, 5, 4, 5,   6, 7, 6, 7,   8, 9, 8, 9,
+    10,11,10,11,  12,13,12,13,  14,15,14,15,  16,17,16,17,  18,19,18,19,
+    20,21,20,21,  22,23,22,23,  24,25,24,25,  26,27,26,27,  28,29,28,29
+};
+
+struct alignas(32) WacaV31Stage25Ply {
+    int16_t w[WACA_V31_F25]{}; // 16B
+    int32_t b = 0;             //  4B
+};
+
+struct alignas(64) WacaV31MlpPly {
+    int8_t  w1[WACA_V31_MAX_HID][WACA_V31_F3]{}; // 768B
+    int32_t b1[WACA_V31_MAX_HID]{};              //  96B
+    int16_t w2[WACA_V31_MAX_HID]{};              //  48B
+    int32_t b2 = 0;                              //   4B
+};
+
+struct WacaG2V31Weights {
+    int32_t                                          mlp_hidden = 16; // 16 or 24
+    RawNTuple64Weights                               tier1;           // 46.92 MiB untouched RAW_64!
+    std::array<WacaV31Stage25Ply, NUM_PLIES>         s25{};           //  1.92 KiB (L1D)
+    std::array<std::vector<WacaKeyEmb4>, WACA_V31_EO_BLOCKS> h_emb;   // 10.51 MiB (Stage 3 only!)
+    std::array<SCReLUPlyParams, NUM_PLIES>           screlu{};        //  2.81 KiB (L1D)
+    std::array<WacaV31MlpPly, NUM_PLIES>             mlp{};           // <= 57 KiB (L1D/L2)
+
+    WacaG2V31Weights() {
+        const auto& pt = get_pattern_tables();
+        for (int b = 0; b < WACA_V31_EO_BLOCKS; ++b) {
+            h_emb[b].assign(static_cast<size_t>(pt.key_raw_entries), WacaKeyEmb4{});
+        }
+    }
+
+    // Strict D4 internal mirror symmetrization & overflow-safe parameter clamping
+    void symmetrize() {
+        tier1.symmetrize();
+        const auto& pt = get_pattern_tables();
+        auto clamp_i8 = [](int8_t v) -> int8_t { return (v == INT8_MIN) ? -127 : v; };
+
+        for (int b = 0; b < WACA_V31_EO_BLOCKS; ++b) {
+            WacaKeyEmb4* tbl = h_emb[b].data();
+            for (int t = 0; t < 4; ++t) {
+                const int32_t off = pt.type_raw_off[t];
+                const int32_t sz  = pt.type_raw_size[t];
+                const int ng      = pt.type_sym[t].num_gens;
+                std::vector<uint8_t> vis(static_cast<size_t>(sz), 0);
+                for (int32_t x = 0; x < sz; ++x) {
+                    if (vis[x]) continue;
+                    std::vector<int32_t> orb;
+                    orb.push_back(x);
+                    vis[x] = 1;
+                    for (size_t qi = 0; qi < orb.size(); ++qi) {
+                        int32_t cur = orb[qi];
+                        for (int g = 0; g < ng; ++g) {
+                            int32_t nxt = pt.permute_raw_index(t, g, cur);
+                            if (!vis[nxt]) {
+                                vis[nxt] = 1;
+                                orb.push_back(nxt);
+                            }
+                        }
+                    }
+                    WacaKeyEmb4 rep = tbl[off + x];
+                    for (int k = 0; k < 4; ++k) rep.h[k] = clamp_i8(rep.h[k]);
+                    for (int32_t idx : orb) tbl[off + idx] = rep;
+                }
+            }
+        }
+
+        mlp_hidden = std::clamp<int32_t>(mlp_hidden, 1, WACA_V31_MAX_HID);
+        for (int ply = 0; ply < NUM_PLIES; ++ply) {
+            s25[ply].b = std::clamp<int32_t>(s25[ply].b, -WACA_S25_B_MAX, WACA_S25_B_MAX);
+            for (int i = 0; i < WACA_V31_F25; ++i) {
+                s25[ply].w[i] = static_cast<int16_t>(
+                    std::clamp<int32_t>(s25[ply].w[i], -WACA_S25_W_MAX, WACA_S25_W_MAX));
+            }
+            for (int g = 0; g < 3; ++g) {
+                for (int k = 0; k < 4; ++k) {
+                    screlu[ply].beta[g][k] = static_cast<int16_t>(
+                        std::clamp<int32_t>(screlu[ply].beta[g][k], -SCRELU_BETA_MAX, SCRELU_BETA_MAX));
+                }
+            }
+            mlp[ply].b2 = std::clamp<int32_t>(mlp[ply].b2, -WACA_MLP_B2_MAX, WACA_MLP_B2_MAX);
+            for (int j = 0; j < WACA_V31_MAX_HID; ++j) {
+                mlp[ply].b1[j] = std::clamp<int32_t>(mlp[ply].b1[j], -WACA_MLP_B1_MAX, WACA_MLP_B1_MAX);
+                mlp[ply].w2[j] = static_cast<int16_t>(
+                    std::clamp<int32_t>(mlp[ply].w2[j], -WACA_MLP_W2_MAX, WACA_MLP_W2_MAX));
+                for (int i = 0; i < WACA_V31_F3; ++i) {
+                    mlp[ply].w1[j][i] = clamp_i8(mlp[ply].w1[j][i]);
+                }
+            }
+        }
+    }
+};
+
+// v3.1 Stage 1: Identical 20-insn 64-pattern PTM loop (0.0% overhead on gated leaves!)
+template<bool IS_WHITE>
+__attribute__((noinline, noclone))
+int32_t eval_waca_v31_stage1_ptm(const RawNTuple64Weights& tier1,
+                                 const PatternMeta* __restrict meta,
+                                 const uint16_t* __restrict idx,
+                                 int ply) noexcept {
+    const int16_t* __restrict wp = tier1.w_ply[ply].data();
+    int32_t sum = 0;
+    for (int p = 0; p < NUM_PATTERNS; ++p) {
+        const int32_t flat = IS_WHITE ? (meta[p].raw_off_end - idx[p]) : (meta[p].raw_off + idx[p]);
+        sum += wp[flat];
+    }
+    return sum;
+}
+
+// v3.1 Stage 2.5 feature extraction: 8 dims, 0 adj_mask_bb, 0 Tier-1 reloads, ONLY 3 popcount64_swar!
+// Outputs mvP, mvO for zero-recomputation reuse in Stage 3.
+__attribute__((always_inline))
+static inline void extract_waca_v31_stage25_features(uint64_t P, uint64_t O,
+                                                     int32_t v1, int ply,
+                                                     int32_t f_out[WACA_V31_F25],
+                                                     uint64_t& out_mvP,
+                                                     uint64_t& out_mvO) noexcept {
+    uint64_t mvP = 0, mvO = 0;
+    generate_moves_pair(P, O, mvP, mvO);
+    out_mvP = mvP;
+    out_mvO = mvO;
+
+    const int32_t mobP  = popcount64_swar(mvP);
+    const int32_t mobO  = popcount64_swar(mvO);
+    const int32_t cmobP = popcount4_corners(mvP);
+    const int32_t cmobO = popcount4_corners(mvO);
+    const int32_t xmobP = popcount4_xsqs(mvP);
+    const int32_t xmobO = popcount4_xsqs(mvO);
+    const int32_t dP    = popcount64_swar(P);
+
+    f_out[0] = clamp_feat_i32((mobP - mobO) << 4);
+    f_out[1] = clamp_feat_i32(((mobP + mobO) - 16) << 3);
+    f_out[2] = ((mobP == 0) ? 128 : 0) - ((mobO == 0) ? 128 : 0);
+    f_out[3] = clamp_feat_i32((cmobP - cmobO) << 6);
+    f_out[4] = clamp_feat_i32((xmobP - xmobO) << 6);
+    f_out[5] = clamp_feat_i32((2 * dP - (ply + 4)) << 3);
+    f_out[6] = clamp_feat_i32(sym_rshift(v1, 4));
+    f_out[7] = clamp_feat_i32(sym_rshift(v1, 2));
+}
+
+// v3.1 Stage 2.5 Kernel: Ultra-Light 8-Dim Linear Gate (~55-65 ns, 0 SIMD, 0 PLT calls!)
+__attribute__((noinline, noclone))
+inline int32_t eval_waca_v31_stage25_kernel(const WacaG2V31Weights& w,
+                                            uint64_t P, uint64_t O,
+                                            int32_t v1, int ply,
+                                            int32_t f_out[WACA_V31_F25],
+                                            uint64_t& out_mvP,
+                                            uint64_t& out_mvO) noexcept {
+    extract_waca_v31_stage25_features(P, O, v1, ply, f_out, out_mvP, out_mvO);
+    const WacaV31Stage25Ply& sp = w.s25[ply];
+    const int32_t a0 = sp.b
+                     + static_cast<int32_t>(sp.w[0]) * f_out[0]
+                     + static_cast<int32_t>(sp.w[4]) * f_out[4];
+    const int32_t a1 = static_cast<int32_t>(sp.w[1]) * f_out[1]
+                     + static_cast<int32_t>(sp.w[5]) * f_out[5];
+    const int32_t a2 = static_cast<int32_t>(sp.w[2]) * f_out[2]
+                     + static_cast<int32_t>(sp.w[6]) * f_out[6];
+    const int32_t a3 = static_cast<int32_t>(sp.w[3]) * f_out[3]
+                     + static_cast<int32_t>(sp.w[7]) * f_out[7];
+    const int32_t acc = (a0 + a1) + (a2 + a3);
+    return std::clamp<int32_t>(sym_rshift(acc, WACA_S25_SHIFT), -WACA_MAX_RES, WACA_MAX_RES);
+}
+
+// v3.1 Stage 3: Single-pass L1D-hot 5-zone geometric decomposition of all 64 Tier-1 patterns
+//   Zone 1: c[0..3]     (p = 0..3:  Corner 3x3)
+//   Zone 2: e[0..3]     (p = 4..7:  Edge+2X)
+//   Zone 3: inner_sum   (p = 8..21: Line2, Diag8, Line3, Line4 + p = 62..63: Center 2x4)
+//   Zone 4: subdiag_sum (p = 22..37: Diag 7, 6, 5, 4)
+//   Zone 5: outer10_sum = v1 - (c_sum + e_sum + inner_sum + subdiag_sum) [p = 38..61, 0 extra loads!]
+template<bool IS_WHITE>
+__attribute__((always_inline))
+static inline void extract_waca_v31_zones_ptm(const RawNTuple64Weights& tier1,
+                                              const PatternMeta* __restrict meta,
+                                              const uint16_t* __restrict idx,
+                                              int ply, int32_t v1,
+                                              int32_t c_out[4], int32_t e_out[4],
+                                              int32_t& out_inner_sum,
+                                              int32_t& out_subdiag_sum,
+                                              int32_t& out_outer10_sum) noexcept {
+    const int16_t* __restrict wp = tier1.w_ply[ply].data();
+    int32_t c_sum = 0, e_sum = 0, inner_sum = 0, subdiag_sum = 0;
+    for (int p = 0; p < 4; ++p) {
+        const int32_t flat = IS_WHITE ? (meta[p].raw_off_end - idx[p]) : (meta[p].raw_off + idx[p]);
+        const int32_t wv = wp[flat];
+        c_out[p] = wv;
+        c_sum += wv;
+    }
+    for (int p = 4; p < 8; ++p) {
+        const int32_t flat = IS_WHITE ? (meta[p].raw_off_end - idx[p]) : (meta[p].raw_off + idx[p]);
+        const int32_t wv = wp[flat];
+        e_out[p - 4] = wv;
+        e_sum += wv;
+    }
+    for (int p = 8; p < 22; ++p) {
+        const int32_t flat = IS_WHITE ? (meta[p].raw_off_end - idx[p]) : (meta[p].raw_off + idx[p]);
+        inner_sum += wp[flat];
+    }
+    for (int p = 22; p < 38; ++p) {
+        const int32_t flat = IS_WHITE ? (meta[p].raw_off_end - idx[p]) : (meta[p].raw_off + idx[p]);
+        subdiag_sum += wp[flat];
+    }
+    for (int p = 62; p < 64; ++p) {
+        const int32_t flat = IS_WHITE ? (meta[p].raw_off_end - idx[p]) : (meta[p].raw_off + idx[p]);
+        inner_sum += wp[flat];
+    }
+    out_inner_sum   = inner_sum;
+    out_subdiag_sum = subdiag_sum;
+    out_outer10_sum = v1 - (c_sum + e_sum + inner_sum + subdiag_sum);
+}
+
+// v3.1 Stage 3 extra 20 features f[8..27] (shared verbatim by C++ inference & OpenMP training bridge!)
+//   f_ext[0..3]  = f[8..11]  : edge mobility, potential mobility, frontier, corner-edge+triangle stability
+//   f_ext[4..7]  = f[12..15] : 4-neighbor connected empty-region parity & board fragmentation (ply >= 24)
+//   f_ext[8..19] = f[16..27] : 5-zone 64-pattern geometric decomposition + 4-quadrant symmetric polynomials
+__attribute__((always_inline))
+static inline void extract_waca_v31_stage3_extra_features(uint64_t P, uint64_t O,
+                                                          uint64_t mvP, uint64_t mvO,
+                                                          int ply,
+                                                          const int32_t c[4], const int32_t e[4],
+                                                          int32_t inner_sum,
+                                                          int32_t subdiag_sum,
+                                                          int32_t outer10_sum,
+                                                          int32_t f_ext[WACA_V31_F3_EXTRA]) noexcept {
+    // f[8..11]: Bitboard features reusing mvP/mvO from Stage 2.5
+    constexpr uint64_t EDGES = 0xff818181818181ffULL;
+    const int32_t emobP = popcount64_swar(mvP & EDGES);
+    const int32_t emobO = popcount64_swar(mvO & EDGES);
+    const uint64_t E    = ~(P | O);
+    const int32_t potP  = popcount64_swar(adj_mask_bb(O) & E);
+    const int32_t potO  = popcount64_swar(adj_mask_bb(P) & E);
+    const uint64_t adjE = adj_mask_bb(E);
+    const int32_t frP   = popcount64_swar(P & adjE);
+    const int32_t frO   = popcount64_swar(O & adjE);
+    const int32_t stabP = count_edge_stable_bb(P);
+    const int32_t stabO = count_edge_stable_bb(O);
+
+    f_ext[0] = clamp_feat_i32((emobP - emobO) << 4);
+    f_ext[1] = clamp_feat_i32((potP - potO) << 4);
+    f_ext[2] = clamp_feat_i32((frP - frO) << 4);
+    f_ext[3] = clamp_feat_i32((stabP - stabO) << 4);
+
+    // f[12..15]: 4-neighbor connected empty-region parity & board fragmentation (0 cost when ply < 24!)
+    int32_t odd_cnt = 0, single_cnt = 0, odd_mv_diff = 0, reg_cnt = 0;
+    if (ply < 24) {
+        odd_cnt     = (60 - ply) & 1;
+        single_cnt  = 0;
+        odd_mv_diff = 0;
+        reg_cnt     = 1;
+    } else {
+        // Fast-path: extract all isolated 1-empty regions in O(1) without Flood-Fill iterations
+        const uint64_t adjE4 = ((E << 1) & 0xfefefefefefefefeULL)
+                             | ((E >> 1) & 0x7f7f7f7f7f7f7f7fULL)
+                             | (E << 8)
+                             | (E >> 8);
+        const uint64_t singles = E & ~adjE4;
+        if (singles) {
+            single_cnt  = popcount64_swar(singles);
+            odd_cnt     = single_cnt;
+            reg_cnt     = single_cnt;
+            odd_mv_diff = popcount64_swar(singles & mvP) - popcount64_swar(singles & mvO);
+        }
+        uint64_t rem = E ^ singles;
+        while (rem) {
+            uint64_t comp = rem & (~rem + 1ULL);
+            uint64_t prev;
+            do {
+                prev = comp;
+                comp |= (((comp << 1) & 0xfefefefefefefefeULL)
+                       | ((comp >> 1) & 0x7f7f7f7f7f7f7f7fULL)
+                       | (comp << 8)
+                       | (comp >> 8)) & rem;
+                comp |= (((comp << 1) & 0xfefefefefefefefeULL)
+                       | ((comp >> 1) & 0x7f7f7f7f7f7f7f7fULL)
+                       | (comp << 8)
+                       | (comp >> 8)) & rem;
+            } while (comp != prev);
+            rem ^= comp;
+            reg_cnt++;
+            const int32_t sz = (reg_cnt == 1 && rem == 0ULL) ? (60 - ply) : popcount64_swar(comp);
+            if (sz & 1) {
+                odd_cnt++;
+                odd_mv_diff += ((comp & mvP) != 0ULL ? 1 : 0) - ((comp & mvO) != 0ULL ? 1 : 0);
+            }
+        }
+    }
+    f_ext[4] = clamp_feat_i32((odd_cnt - 1) << 5);
+    f_ext[5] = clamp_feat_i32(single_cnt << 6);
+    f_ext[6] = clamp_feat_i32(odd_mv_diff << 6);
+    f_ext[7] = clamp_feat_i32((reg_cnt - 2) << 5);
+
+    // f[16..27]: Full 64-pattern 5-zone geometric decomposition + 4-quadrant symmetric polynomials
+    const int32_t c_sum = c[0] + c[1] + c[2] + c[3];
+    const int32_t e_sum = e[0] + e[1] + e[2] + e[3];
+    int32_t c_min = c[0], c_max = c[0], e_min = e[0], e_max = e[0];
+    for (int i = 1; i < 4; ++i) {
+        if (c[i] < c_min) c_min = c[i];
+        if (c[i] > c_max) c_max = c[i];
+        if (e[i] < e_min) e_min = e[i];
+        if (e[i] > e_max) e_max = e[i];
+    }
+
+    int32_t cs[4], es[4];
+    int32_t c_sq = 0;
+    for (int i = 0; i < 4; ++i) {
+        cs[i] = std::clamp<int32_t>(sym_rshift(c[i], 4), -256, 256);
+        es[i] = std::clamp<int32_t>(sym_rshift(e[i], 4), -256, 256);
+        c_sq += cs[i] * cs[i];
+    }
+    const int32_t diag_prod = cs[0] * cs[2] + cs[1] * cs[3];
+    const int32_t adj_diff  = abs_i32(cs[0] - cs[1]) + abs_i32(cs[1] - cs[2])
+                            + abs_i32(cs[2] - cs[3]) + abs_i32(cs[3] - cs[0]);
+    const int32_t diag_diff = abs_i32(cs[0] - cs[2]) + abs_i32(cs[1] - cs[3]);
+    const int32_t polar     = adj_diff - 2 * diag_diff;
+    const int32_t ce_coup   = cs[0] * (es[0] + es[3]) + cs[1] * (es[1] + es[0])
+                            + cs[2] * (es[2] + es[1]) + cs[3] * (es[3] + es[2]);
+
+    f_ext[8]  = clamp_feat_i32(sym_rshift(c_sum, 3));
+    f_ext[9]  = clamp_feat_i32(sym_rshift(e_sum, 3));
+    f_ext[10] = clamp_feat_i32(sym_rshift(c_max - c_min, 3));
+    f_ext[11] = clamp_feat_i32(sym_rshift(e_max - e_min, 3));
+    f_ext[12] = clamp_feat_i32(sym_rshift(c_sq, 7));
+    f_ext[13] = clamp_feat_i32(sym_rshift(diag_prod, 6));
+    f_ext[14] = clamp_feat_i32(sym_rshift(polar, 1));
+    f_ext[15] = clamp_feat_i32(sym_rshift(ce_coup, 7));
+    f_ext[16] = clamp_feat_i32(sym_rshift(inner_sum, 3));
+    f_ext[17] = clamp_feat_i32(sym_rshift(subdiag_sum, 3));
+    f_ext[18] = clamp_feat_i32(sym_rshift(outer10_sum, 3));
+    f_ext[19] = clamp_feat_i32(sym_rshift(inner_sum - (c_sum + e_sum + outer10_sum), 4));
+}
+
+// v3.1 Stage 3 Kernel: 30-Block EO Key-14 4ch SCReLU + 60-Ply 32->H->1 Integer SCReLU MLP (0 SIMD!)
+template<bool IS_WHITE>
+__attribute__((noinline, noclone))
+int32_t eval_waca_v31_stage3_ptm(const WacaG2V31Weights& w,
+                                 const PatternMeta* __restrict meta,
+                                 const uint16_t* __restrict idx,
+                                 uint64_t P, uint64_t O,
+                                 uint64_t mvP, uint64_t mvO,
+                                 int32_t v1,
+                                 const int32_t* __restrict f25,
+                                 int32_t r25,
+                                 int ply) noexcept {
+    int32_t c[4], e[4];
+    int32_t inner_sum = 0, subdiag_sum = 0, outer10_sum = 0;
+    extract_waca_v31_zones_ptm<IS_WHITE>(w.tier1, meta, idx, ply, v1, c, e,
+                                         inner_sum, subdiag_sum, outer10_sum);
+
+    int32_t f_ext[24];
+    extract_waca_v31_stage3_extra_features(P, O, mvP, mvO, ply, c, e,
+                                           inner_sum, subdiag_sum, outer10_sum, f_ext);
+
+    // 1) Physically separated 30-block Even/Odd Key-14 4ch embeddings (ONLY touched on ~5-7% leaves!)
+    const uint8_t eo_blk = PLY_TO_EO30_BLK[ply];
+    const WacaKeyEmb4* __restrict htbl = w.h_emb[eo_blk].data();
+    int32_t h0[NUM_KEY_PATTERNS], h1[NUM_KEY_PATTERNS];
+    int32_t h2[NUM_KEY_PATTERNS], h3[NUM_KEY_PATTERNS];
+    int32_t g0 = 0, g1 = 0, g2 = 0, g3 = 0;
+    for (int p = 0; p < NUM_KEY_PATTERNS; ++p) {
+        const int32_t flat = IS_WHITE ? (meta[p].raw_off_end - idx[p]) : (meta[p].raw_off + idx[p]);
+        const WacaKeyEmb4 emb = htbl[flat];
+        const int32_t e0 = emb.h[0], e1 = emb.h[1], e2 = emb.h[2], e3 = emb.h[3];
+        h0[p] = e0; h1[p] = e1; h2[p] = e2; h3[p] = e3;
+        g0 += e0;   g1 += e1;   g2 += e2;   g3 += e3;
+    }
+
+    const SCReLUPlyParams& sc = w.screlu[ply];
+    int32_t s0_0 = 0, s0_1 = 0, s0_2 = 0, s0_3 = 0;
+    {
+        const int32_t m0 = sc.mu[0][0], m1 = sc.mu[0][1], m2 = sc.mu[0][2], m3 = sc.mu[0][3];
+        for (int r = 0; r < 4; ++r) {
+            const int c1 = (r + 1) & 3;
+            const int32_t u0 = clamp_i32(h0[4 + r] + h0[8 + r] + h0[r] + h0[c1] + m0, SCRELU_Q);
+            const int32_t u1 = clamp_i32(h1[4 + r] + h1[8 + r] + h1[r] + h1[c1] + m1, SCRELU_Q);
+            const int32_t u2 = clamp_i32(h2[4 + r] + h2[8 + r] + h2[r] + h2[c1] + m2, SCRELU_Q);
+            const int32_t u3 = clamp_i32(h3[4 + r] + h3[8 + r] + h3[r] + h3[c1] + m3, SCRELU_Q);
+            s0_0 += u0 * u0; s0_1 += u1 * u1; s0_2 += u2 * u2; s0_3 += u3 * u3;
+        }
+    }
+    int32_t s1_0 = 0, s1_1 = 0, s1_2 = 0, s1_3 = 0;
+    {
+        const int32_t m0 = sc.mu[1][0], m1 = sc.mu[1][1], m2 = sc.mu[1][2], m3 = sc.mu[1][3];
+        for (int d = 0; d < 2; ++d) {
+            const int32_t u0 = clamp_i32(h0[12 + d] + h0[d] + h0[d + 2] + m0, SCRELU_Q);
+            const int32_t u1 = clamp_i32(h1[12 + d] + h1[d] + h1[d + 2] + m1, SCRELU_Q);
+            const int32_t u2 = clamp_i32(h2[12 + d] + h2[d] + h2[d + 2] + m2, SCRELU_Q);
+            const int32_t u3 = clamp_i32(h3[12 + d] + h3[d] + h3[d + 2] + m3, SCRELU_Q);
+            s1_0 += u0 * u0; s1_1 += u1 * u1; s1_2 += u2 * u2; s1_3 += u3 * u3;
+        }
+    }
+    const int32_t ug0 = clamp_i32(g0 + sc.mu[2][0], SCRELU_Q);
+    const int32_t ug1 = clamp_i32(g1 + sc.mu[2][1], SCRELU_Q);
+    const int32_t ug2 = clamp_i32(g2 + sc.mu[2][2], SCRELU_Q);
+    const int32_t ug3 = clamp_i32(g3 + sc.mu[2][3], SCRELU_Q);
+    const int32_t s2_0 = ug0 * ug0, s2_1 = ug1 * ug1, s2_2 = ug2 * ug2, s2_3 = ug3 * ug3;
+
+    const int32_t sc_acc =
+          static_cast<int32_t>(sc.beta[0][0]) * s0_0 + static_cast<int32_t>(sc.beta[0][1]) * s0_1
+        + static_cast<int32_t>(sc.beta[0][2]) * s0_2 + static_cast<int32_t>(sc.beta[0][3]) * s0_3
+        + static_cast<int32_t>(sc.beta[1][0]) * s1_0 + static_cast<int32_t>(sc.beta[1][1]) * s1_1
+        + static_cast<int32_t>(sc.beta[1][2]) * s1_2 + static_cast<int32_t>(sc.beta[1][3]) * s1_3
+        + static_cast<int32_t>(sc.beta[2][0]) * s2_0 + static_cast<int32_t>(sc.beta[2][1]) * s2_1
+        + static_cast<int32_t>(sc.beta[2][2]) * s2_2 + static_cast<int32_t>(sc.beta[2][3]) * s2_3;
+    const int32_t r_key_screlu = sym_rshift(sc_acc, SCRELU_SHIFT);
+
+    // f[28..31]: 4-channel Key-14 nonlinear summary features
+    f_ext[20] = clamp_feat_i32((s0_0 + s1_0 + s2_0) >> 8);
+    f_ext[21] = clamp_feat_i32((s0_1 + s1_1 + s2_1) >> 8);
+    f_ext[22] = clamp_feat_i32((s0_2 + s1_2 + s2_2) >> 8);
+    f_ext[23] = clamp_feat_i32((s0_3 + s1_3 + s2_3) >> 8);
+
+    // 2) 60-ply Pure-Integer SCReLU MLP (32 -> H -> 1, 4-way unrolled scalar ILP, overflow-proof in int32_t!)
+    const WacaV31MlpPly& mp = w.mlp[ply];
+    const int H = w.mlp_hidden;
+    int32_t acc2 = mp.b2;
+    for (int j = 0; j < H; ++j) {
+        const int8_t* __restrict w1j = mp.w1[j];
+        int32_t z0 = mp.b1[j], z1 = 0, z2 = 0, z3 = 0;
+        for (int i = 0; i < WACA_V31_F25; i += 4) {
+            z0 += static_cast<int32_t>(w1j[i + 0]) * f25[i + 0];
+            z1 += static_cast<int32_t>(w1j[i + 1]) * f25[i + 1];
+            z2 += static_cast<int32_t>(w1j[i + 2]) * f25[i + 2];
+            z3 += static_cast<int32_t>(w1j[i + 3]) * f25[i + 3];
+        }
+        for (int i = 0; i < 24; i += 4) {
+            z0 += static_cast<int32_t>(w1j[WACA_V31_F25 + i + 0]) * f_ext[i + 0];
+            z1 += static_cast<int32_t>(w1j[WACA_V31_F25 + i + 1]) * f_ext[i + 1];
+            z2 += static_cast<int32_t>(w1j[WACA_V31_F25 + i + 2]) * f_ext[i + 2];
+            z3 += static_cast<int32_t>(w1j[WACA_V31_F25 + i + 3]) * f_ext[i + 3];
+        }
+        const int32_t z = (z0 + z1) + (z2 + z3);
+        const int32_t u = (z <= 0) ? 0 : (((z >> WACA_MLP_S1) > SCRELU_Q) ? SCRELU_Q : (z >> WACA_MLP_S1));
+        acc2 += static_cast<int32_t>(mp.w2[j]) * (u * u);
+    }
+    const int32_t r_mlp = sym_rshift(acc2, WACA_MLP_S2);
+
+    return std::clamp<int32_t>(r25 + r_mlp + r_key_screlu, -WACA_MAX_RES, WACA_MAX_RES);
+}
+
+// Evaluate all 3 stages unconditionally (used for bit-exact testing, Val RMSE, and GateMode::FULL)
+inline void eval_waca_g2_v31_stages(const WacaG2V31Weights& w,
+                                    const PatternMeta* __restrict meta,
+                                    const uint16_t* __restrict idx,
+                                    uint64_t B, uint64_t W, int stm, int ply,
+                                    int32_t& out_v1, int32_t& out_v25, int32_t& out_v3) noexcept {
+    const bool is_w = (stm < 0);
+    const uint64_t P = is_w ? W : B;
+    const uint64_t O = is_w ? B : W;
+    int32_t f25[WACA_V31_F25];
+    uint64_t mvP = 0, mvO = 0;
+    const int32_t v1  = is_w ? eval_waca_v31_stage1_ptm<true>(w.tier1, meta, idx, ply)
+                             : eval_waca_v31_stage1_ptm<false>(w.tier1, meta, idx, ply);
+    const int32_t r25 = eval_waca_v31_stage25_kernel(w, P, O, v1, ply, f25, mvP, mvO);
+    const int32_t rt  = is_w ? eval_waca_v31_stage3_ptm<true>(w, meta, idx, P, O, mvP, mvO, v1, f25, r25, ply)
+                             : eval_waca_v31_stage3_ptm<false>(w, meta, idx, P, O, mvP, mvO, v1, f25, r25, ply);
+    out_v1  = v1;
+    out_v25 = v1 + r25;
+    out_v3  = v1 + rt;
+}
+
+inline int32_t eval_waca_g2_v31_full(const WacaG2V31Weights& w,
+                                     const PatternMeta* __restrict meta,
+                                     const uint16_t* __restrict idx,
+                                     uint64_t B, uint64_t W, int stm, int ply) noexcept {
+    int32_t v1 = 0, v25 = 0, v3 = 0;
+    eval_waca_g2_v31_stages(w, meta, idx, B, W, stm, ply, v1, v25, v3);
+    return v3;
+}
+
+// Search-integrated 2-stage gated evaluator for WACA_G2_V31 (SAFE_BND / FAIL_HARD / FULL / WIDE_SAFE_BND)
+inline int32_t eval_waca_g2_v31_gated(const WacaG2V31Weights& w,
+                                      const PatternMeta* __restrict meta,
+                                      const uint16_t* __restrict idx,
+                                      uint64_t B, uint64_t W, int stm, int ply,
+                                      int32_t alpha, int32_t beta,
+                                      bool in_mpc_probe,
+                                      GateMode gate_mode,
+                                      int32_t m25_units,
+                                      int32_t m3_units,
+                                      uint64_t& stat_s25,
+                                      uint64_t& stat_s3,
+                                      int32_t tt_guard_units = 576) noexcept {
+    const bool is_w = (stm < 0);
+    const int32_t v1 = is_w ? eval_waca_v31_stage1_ptm<true>(w.tier1, meta, idx, ply)
+                            : eval_waca_v31_stage1_ptm<false>(w.tier1, meta, idx, ply);
+
+    if (in_mpc_probe) return v1;
+
+    const bool is_pv = (beta > alpha + 1);
+    if (!is_pv && gate_mode != GateMode::FULL) {
+        if (v1 + m25_units <= alpha) return gate_return_low(gate_mode, v1, m25_units, tt_guard_units, alpha);
+        if (v1 - m25_units >= beta)  return gate_return_high(gate_mode, v1, m25_units, tt_guard_units, beta);
+    }
+
+    // Ultra-light Stage 2.5 (~55-65 ns, 0 Tier-1 reloads, 3 SWAR popcounts!)
+    stat_s25++;
+    const uint64_t P = is_w ? W : B;
+    const uint64_t O = is_w ? B : W;
+    int32_t f25[WACA_V31_F25];
+    uint64_t mvP = 0, mvO = 0;
+    const int32_t r25 = eval_waca_v31_stage25_kernel(w, P, O, v1, ply, f25, mvP, mvO);
+    const int32_t v25 = v1 + r25;
+
+    if (!is_pv && gate_mode != GateMode::FULL) {
+        if (v25 + m3_units <= alpha) return gate_return_low(gate_mode, v25, m3_units, tt_guard_units, alpha);
+        if (v25 - m3_units >= beta)  return gate_return_high(gate_mode, v25, m3_units, tt_guard_units, beta);
+    }
+
+    // Long-term Stage 3 (~5-7% leaves: 4-neighbor parity + 5-zone 64-pat + 30-blk EO Key14 + 32->H->1 MLP)
+    stat_s3++;
+    const int32_t rt = is_w ? eval_waca_v31_stage3_ptm<true>(w, meta, idx, P, O, mvP, mvO, v1, f25, r25, ply)
+                            : eval_waca_v31_stage3_ptm<false>(w, meta, idx, P, O, mvP, mvO, v1, f25, r25, ply);
     return v1 + rt;
 }
 

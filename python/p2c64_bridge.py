@@ -99,6 +99,20 @@ class P2C64Bridge:
         ]
         self.lib.waca_g2_eval_file_batch_stages.restype = ctypes.c_int32
 
+        self.lib.waca_g2_v31_extract_batch_features.argtypes = [
+            c_u64_p, c_u64_p, c_i8_p, c_u8_p,
+            ctypes.c_int32, c_i16_p, ctypes.c_uint64, ctypes.c_int32,
+            c_i32_p, c_i32_p, c_i32_p, c_i32_p,
+        ]
+        self.lib.waca_g2_v31_extract_batch_features.restype = None
+
+        self.lib.waca_g2_v31_eval_file_batch_stages.argtypes = [
+            ctypes.c_char_p,
+            c_u64_p, c_u64_p, c_i8_p, c_u8_p,
+            ctypes.c_int32, c_i32_p, c_i32_p, c_i32_p, c_i32_p,
+        ]
+        self.lib.waca_g2_v31_eval_file_batch_stages.restype = ctypes.c_int32
+
         self.lib.p2c64_fnv1a_64.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
         self.lib.p2c64_fnv1a_64.restype = ctypes.c_uint64
 
@@ -298,4 +312,95 @@ class P2C64Bridge:
         )
         if h < 0:
             raise RuntimeError(f"C++ waca_g2_eval_file_batch_stages failed on {p2c_path}")
+        return int(h), v1, v25, v3, sym3
+
+    def extract_waca_g2_v31_batch(
+        self,
+        black: np.ndarray,
+        white: np.ndarray,
+        stm: np.ndarray,
+        ply: np.ndarray,
+        tier1_w_ply: np.ndarray,
+        aug_seed: int = 0,
+        enable_aug: bool = False,
+        need_stage3: bool = True,
+    ) -> Dict[str, np.ndarray]:
+        black = np.ascontiguousarray(black, dtype=np.uint64)
+        white = np.ascontiguousarray(white, dtype=np.uint64)
+        stm = np.ascontiguousarray(stm, dtype=np.int8)
+        ply = np.ascontiguousarray(ply, dtype=np.uint8)
+        t1w = np.ascontiguousarray(tier1_w_ply, dtype=np.int16)
+        assert t1w.shape == (NUM_PLIES, TOTAL_RAW_ENTRIES)
+        n = int(black.shape[0])
+
+        c_u64_p = ctypes.POINTER(ctypes.c_uint64)
+        c_u8_p = ctypes.POINTER(ctypes.c_uint8)
+        c_i8_p = ctypes.POINTER(ctypes.c_int8)
+        c_i16_p = ctypes.POINTER(ctypes.c_int16)
+        c_i32_p = ctypes.POINTER(ctypes.c_int32)
+
+        v1 = np.empty(n, dtype=np.int32)
+        f25 = np.empty((n, 8), dtype=np.int32)
+        out: Dict[str, np.ndarray] = {"v1": v1, "f25": f25}
+        if need_stage3:
+            f3_extra = np.empty((n, 20), dtype=np.int32)
+            key_ptm = np.empty((n, NUM_KEY_PATTERNS), dtype=np.int32)
+            p_f3 = f3_extra.ctypes.data_as(c_i32_p)
+            p_kp = key_ptm.ctypes.data_as(c_i32_p)
+            out["f3_extra"] = f3_extra
+            out["key_ptm"] = key_ptm
+        else:
+            p_f3 = ctypes.cast(0, c_i32_p)
+            p_kp = ctypes.cast(0, c_i32_p)
+
+        self.lib.waca_g2_v31_extract_batch_features(
+            black.ctypes.data_as(c_u64_p),
+            white.ctypes.data_as(c_u64_p),
+            stm.ctypes.data_as(c_i8_p),
+            ply.ctypes.data_as(c_u8_p),
+            ctypes.c_int32(n),
+            t1w.ctypes.data_as(c_i16_p),
+            ctypes.c_uint64(aug_seed & 0xFFFFFFFFFFFFFFFF),
+            ctypes.c_int32(1 if enable_aug else 0),
+            v1.ctypes.data_as(c_i32_p),
+            f25.ctypes.data_as(c_i32_p),
+            p_f3,
+            p_kp,
+        )
+        return out
+
+    def eval_waca_g2_v31_file_stages(
+        self,
+        p2c_path: str | os.PathLike,
+        black: np.ndarray,
+        white: np.ndarray,
+        stm: np.ndarray,
+        ply: np.ndarray,
+        check_16sym: bool = False,
+    ) -> Tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        black = np.ascontiguousarray(black, dtype=np.uint64)
+        white = np.ascontiguousarray(white, dtype=np.uint64)
+        stm = np.ascontiguousarray(stm, dtype=np.int8)
+        ply = np.ascontiguousarray(ply, dtype=np.uint8)
+        n = int(black.shape[0])
+        v1 = np.empty(n, dtype=np.int32)
+        v25 = np.empty(n, dtype=np.int32)
+        v3 = np.empty(n, dtype=np.int32)
+        sym3 = np.zeros(3, dtype=np.int32)
+        c_i32_p = ctypes.POINTER(ctypes.c_int32)
+
+        h = self.lib.waca_g2_v31_eval_file_batch_stages(
+            os.fsencode(str(p2c_path)),
+            black.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+            white.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+            stm.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
+            ply.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            ctypes.c_int32(n),
+            v1.ctypes.data_as(c_i32_p),
+            v25.ctypes.data_as(c_i32_p),
+            v3.ctypes.data_as(c_i32_p),
+            sym3.ctypes.data_as(c_i32_p) if check_16sym else ctypes.cast(0, c_i32_p),
+        )
+        if h < 0:
+            raise RuntimeError(f"C++ waca_g2_v31_eval_file_batch_stages failed on {p2c_path}")
         return int(h), v1, v25, v3, sym3

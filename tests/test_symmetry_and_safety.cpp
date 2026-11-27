@@ -534,8 +534,155 @@ static void test_waca_g2_overflow_safety() {
     std::printf("[PASS] Test 7: WACA_G2(H=24) Extreme Boundary int32_t Overflow Safety (exact int64_t match for Stage 2.5 & Stage 3)\n");
 }
 
+static void test_waca_g2_v31_16sym(const std::vector<TestPos>& positions, int mlp_hid, uint64_t seed) {
+    const auto& pt = get_pattern_tables();
+    Rng rng(seed);
+    WacaG2V31Weights w;
+    w.mlp_hidden = mlp_hid;
+    for (int ply = 0; ply < NUM_PLIES; ++ply) {
+        for (int32_t i = 0; i < pt.total_raw_entries; ++i) w.tier1.w_ply[ply][i] = static_cast<int16_t>(rng.range(-1500, 1500));
+        w.s25[ply].b = rng.range(-4000, 4000);
+        for (int i = 0; i < WACA_V31_F25; ++i) w.s25[ply].w[i] = static_cast<int16_t>(rng.range(-600, 600));
+        for (int g = 0; g < 3; ++g) {
+            for (int k = 0; k < 4; ++k) {
+                w.screlu[ply].mu[g][k]   = static_cast<int16_t>(rng.range(8, 64));
+                w.screlu[ply].beta[g][k] = static_cast<int16_t>(rng.range(-300, 300));
+            }
+        }
+        w.mlp[ply].b2 = rng.range(-4000, 4000);
+        for (int j = 0; j < mlp_hid; ++j) {
+            w.mlp[ply].b1[j] = rng.range(-8000, 8000);
+            w.mlp[ply].w2[j] = static_cast<int16_t>(rng.range(-600, 600));
+            for (int i = 0; i < WACA_V31_F3; ++i) w.mlp[ply].w1[j][i] = static_cast<int8_t>(rng.range(-80, 80));
+        }
+    }
+    for (int b = 0; b < WACA_V31_EO_BLOCKS; ++b) {
+        for (auto& e : w.h_emb[b]) {
+            for (int k = 0; k < 4; ++k) e.h[k] = static_cast<int8_t>(rng.range(-60, 60));
+        }
+    }
+    w.symmetrize();
+
+    int32_t max_e1 = 0, max_e25 = 0, max_e3 = 0, max_raw_s1 = 0;
+    int flood_tested = 0;
+    for (const auto& tp : positions) {
+        if (tp.ply >= 24) flood_tested++;
+        uint16_t idx[NUM_PATTERNS];
+        pt.extract_indices(tp.black, tp.white, idx);
+        int32_t v1 = 0, v25 = 0, v3 = 0;
+        eval_waca_g2_v31_stages(w, pt.meta, idx, tp.black, tp.white, tp.stm, tp.ply, v1, v25, v3);
+        const int32_t v_raw = eval_raw_ntuple64(w.tier1, pt.meta, idx, tp.stm, tp.ply);
+        max_raw_s1 = std::max(max_raw_s1, abs_i32(v_raw - v1));
+
+        for (int sym = 0; sym < 16; ++sym) {
+            uint64_t tb = 0, tw = 0;
+            int tstm = 0;
+            transform_board_d4z2(tp.black, tp.white, tp.stm, sym, tb, tw, tstm);
+            uint16_t tidx[NUM_PATTERNS];
+            pt.extract_indices(tb, tw, tidx);
+            int32_t tv1 = 0, tv25 = 0, tv3 = 0;
+            eval_waca_g2_v31_stages(w, pt.meta, tidx, tb, tw, tstm, tp.ply, tv1, tv25, tv3);
+            max_e1  = std::max(max_e1,  abs_i32(tv1 - v1));
+            max_e25 = std::max(max_e25, abs_i32(tv25 - v25));
+            max_e3  = std::max(max_e3,  abs_i32(tv3 - v3));
+        }
+    }
+    if (max_e1 != 0 || max_e25 != 0 || max_e3 != 0 || max_raw_s1 != 0) {
+        std::fprintf(stderr, "FAIL: WACA_G2_V31(H=%d) sym err: s1=%d s25=%d s3=%d raw==s1=%d\n",
+                     mlp_hid, max_e1, max_e25, max_e3, max_raw_s1);
+        std::exit(1);
+    }
+    std::printf("[PASS] Test 8: WACA_G2_V31(H=%d) 16-Symmetry (%zu pos x 16 = %zu evals, flood=%d) | max_err: S1=0 S2.5=0 S3=0 RAW==S1=0\n",
+                mlp_hid, positions.size(), positions.size() * 16, flood_tested);
+}
+
+static void test_waca_g2_v31_overflow_safety() {
+    const auto& pt = get_pattern_tables();
+    WacaG2V31Weights w;
+    w.mlp_hidden = WACA_V31_MAX_HID; // Worst-case H=24
+
+    // Build a realistic ply=34 board with multiple disconnected empty regions (tests Flood-Fill too!)
+    uint64_t B = 0x0000183c3c180000ULL | 0x8100000000000081ULL | 0x0024000000002400ULL;
+    uint64_t W = 0x3c4242000042423cULL & ~B;
+    const int ply = std::clamp(popcount64_swar(B | W) - 4, 24, 59);
+    uint16_t idx[NUM_PATTERNS];
+    pt.extract_indices(B, W, idx);
+
+    for (int sgn : {1, -1}) {
+        for (int p = 0; p < NUM_PLIES; ++p) {
+            for (int32_t i = 0; i < pt.total_raw_entries; ++i) w.tier1.w_ply[p][i] = static_cast<int16_t>(sgn * 30000);
+            w.s25[p].b = sgn * WACA_S25_B_MAX;
+            for (int i = 0; i < WACA_V31_F25; ++i) w.s25[p].w[i] = static_cast<int16_t>(sgn * WACA_S25_W_MAX);
+            for (int g = 0; g < 3; ++g) {
+                for (int k = 0; k < 4; ++k) {
+                    w.screlu[p].mu[g][k]   = 127;
+                    w.screlu[p].beta[g][k] = static_cast<int16_t>(sgn * SCRELU_BETA_MAX);
+                }
+            }
+            w.mlp[p].b2 = sgn * WACA_MLP_B2_MAX;
+            for (int j = 0; j < WACA_V31_MAX_HID; ++j) {
+                w.mlp[p].b1[j] = WACA_MLP_B1_MAX;
+                w.mlp[p].w2[j] = static_cast<int16_t>(sgn * WACA_MLP_W2_MAX);
+                for (int i = 0; i < WACA_V31_F3; ++i) w.mlp[p].w1[j][i] = static_cast<int8_t>(WACA_MLP_W1_MAX);
+            }
+        }
+        for (int b = 0; b < WACA_V31_EO_BLOCKS; ++b) {
+            for (auto& e : w.h_emb[b]) e.h[0] = e.h[1] = e.h[2] = e.h[3] = 127;
+        }
+
+        for (int stm : {1, -1}) {
+            const bool is_w = (stm < 0);
+            const uint64_t P = is_w ? W : B;
+            const uint64_t O = is_w ? B : W;
+            int32_t f25[WACA_V31_F25], fex[WACA_V31_F3_EXTRA], c[4], e[4];
+            uint64_t mvP = 0, mvO = 0;
+            const int32_t v1  = is_w ? eval_waca_v31_stage1_ptm<true>(w.tier1, pt.meta, idx, ply)
+                                     : eval_waca_v31_stage1_ptm<false>(w.tier1, pt.meta, idx, ply);
+            const int32_t r25 = eval_waca_v31_stage25_kernel(w, P, O, v1, ply, f25, mvP, mvO);
+            const int32_t rt  = is_w ? eval_waca_v31_stage3_ptm<true>(w, pt.meta, idx, P, O, mvP, mvO, v1, f25, r25, ply)
+                                     : eval_waca_v31_stage3_ptm<false>(w, pt.meta, idx, P, O, mvP, mvO, v1, f25, r25, ply);
+
+            // Exact int64_t reference for Stage 2.5 and Stage 3!
+            int64_t acc25 = w.s25[ply].b;
+            for (int i = 0; i < WACA_V31_F25; ++i) acc25 += static_cast<int64_t>(w.s25[ply].w[i]) * f25[i];
+            int64_t r25_64 = (acc25 >= 0) ? (acc25 / (1LL << WACA_S25_SHIFT)) : -((-acc25) / (1LL << WACA_S25_SHIFT));
+            r25_64 = std::clamp<int64_t>(r25_64, -WACA_MAX_RES, WACA_MAX_RES);
+
+            int32_t ins = 0, sds = 0, o10 = 0;
+            if (is_w) extract_waca_v31_zones_ptm<true>(w.tier1, pt.meta, idx, ply, v1, c, e, ins, sds, o10);
+            else      extract_waca_v31_zones_ptm<false>(w.tier1, pt.meta, idx, ply, v1, c, e, ins, sds, o10);
+            extract_waca_v31_stage3_extra_features(P, O, mvP, mvO, ply, c, e, ins, sds, o10, fex);
+
+            int64_t f64[WACA_V31_F3];
+            for (int i = 0; i < WACA_V31_F25; ++i) f64[i] = f25[i];
+            for (int i = 0; i < WACA_V31_F3_EXTRA; ++i) f64[WACA_V31_F25 + i] = fex[i];
+            for (int k = 0; k < 4; ++k) f64[28 + k] = (7LL * 127LL * 127LL) >> 8;
+
+            int64_t sc_acc64 = 7LL * 4LL * static_cast<int64_t>(w.screlu[ply].beta[0][0]) * (127LL * 127LL);
+            int64_t r_sc64 = (sc_acc64 >= 0) ? (sc_acc64 / (1LL << SCRELU_SHIFT)) : -((-sc_acc64) / (1LL << SCRELU_SHIFT));
+
+            int64_t acc2_64 = w.mlp[ply].b2;
+            for (int j = 0; j < WACA_V31_MAX_HID; ++j) {
+                int64_t z64 = w.mlp[ply].b1[j];
+                for (int i = 0; i < WACA_V31_F3; ++i) z64 += static_cast<int64_t>(w.mlp[ply].w1[j][i]) * f64[i];
+                int64_t u64 = (z64 <= 0) ? 0 : std::min<int64_t>(z64 >> WACA_MLP_S1, SCRELU_Q);
+                acc2_64 += static_cast<int64_t>(w.mlp[ply].w2[j]) * (u64 * u64);
+            }
+            int64_t r_mlp64 = (acc2_64 >= 0) ? (acc2_64 / (1LL << WACA_MLP_S2)) : -((-acc2_64) / (1LL << WACA_MLP_S2));
+            int64_t rt64 = std::clamp<int64_t>(r25_64 + r_mlp64 + r_sc64, -WACA_MAX_RES, WACA_MAX_RES);
+
+            if (static_cast<int64_t>(r25) != r25_64 || static_cast<int64_t>(rt) != rt64) {
+                std::fprintf(stderr, "FAIL: WACA_G2_V31 overflow mismatch sgn=%d stm=%d r25=(%d vs %lld) rt=(%d vs %lld)\n",
+                             sgn, stm, r25, static_cast<long long>(r25_64), rt, static_cast<long long>(rt64));
+                std::exit(1);
+            }
+        }
+    }
+    std::printf("[PASS] Test 9: WACA_G2_V31(H=24) Extreme Boundary int32_t Overflow Safety (exact int64_t match for Stage 2.5 & Stage 3)\n");
+}
+
 int main() {
-    std::printf("=== P2C-64 v3.0 (Full PTM + WACA-G2): Symmetry, Identity & Overflow Suite ===\n");
+    std::printf("=== P2C-64 v3.1 (Full PTM + WACA-G2 v3.0/v3.1): Symmetry, Identity & Overflow Suite ===\n");
     auto positions = test_incremental_and_collect_positions();
 
     verify_raw_and_linear_identity(positions);
@@ -550,6 +697,9 @@ int main() {
     test_waca_g2_16sym(positions, 16, 5005ULL);
     test_waca_g2_16sym(positions, 24, 6006ULL);
     test_waca_g2_overflow_safety();
+    test_waca_g2_v31_16sym(positions, 16, 7007ULL);
+    test_waca_g2_v31_16sym(positions, 24, 8008ULL);
+    test_waca_g2_v31_overflow_safety();
     std::printf("=== ALL TESTS PASSED (0 ERRORS) ===\n");
     return 0;
 }
