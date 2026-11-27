@@ -175,26 +175,27 @@ struct LoadedModel {
                                    int32_t m3_units,
                                    uint64_t& stat_s25,
                                    uint64_t& stat_s3,
-                                   int32_t tt_guard_units = 576) const noexcept {
+                                   int32_t tt_guard_units = 576,
+                                   int32_t dyn_r25_q4 = 0) const noexcept {
         if (is_waca_v33) {
             return eval_waca_g2_v33_gated(*waca_v33, meta, idx, B, W, stm, ply, alpha, beta,
                                           in_mpc_probe, gate_mode, m25_units, m3_units,
-                                          stat_s25, stat_s3, tt_guard_units);
+                                          stat_s25, stat_s3, tt_guard_units, dyn_r25_q4);
         }
         if (is_waca_v32) {
             return eval_waca_g2_v32_gated(*waca_v32, meta, idx, B, W, stm, ply, alpha, beta,
                                           in_mpc_probe, gate_mode, m25_units, m3_units,
-                                          stat_s25, stat_s3, tt_guard_units);
+                                          stat_s25, stat_s3, tt_guard_units, dyn_r25_q4);
         }
         if (is_waca_v31) {
             return eval_waca_g2_v31_gated(*waca_v31, meta, idx, B, W, stm, ply, alpha, beta,
                                           in_mpc_probe, gate_mode, m25_units, m3_units,
-                                          stat_s25, stat_s3, tt_guard_units);
+                                          stat_s25, stat_s3, tt_guard_units, dyn_r25_q4);
         }
         if (is_waca) {
             return eval_waca_g2_gated(waca, meta, idx, B, W, stm, ply, alpha, beta,
                                       in_mpc_probe, gate_mode, m25_units, m3_units,
-                                      stat_s25, stat_s3, tt_guard_units);
+                                      stat_s25, stat_s3, tt_guard_units, dyn_r25_q4);
         }
         return evaluate(meta, idx, stm, ply);
     }

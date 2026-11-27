@@ -6,9 +6,13 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <sstream>
+#include <string>
 #include <vector>
 
 namespace p2c64 {
@@ -111,6 +115,33 @@ static inline const char* move_order_mode_name(MoveOrderMode mo) noexcept {
     return (mo == MoveOrderMode::B4_HYBRID) ? "b4_hybrid" : "static";
 }
 
+enum class DynGateMode : int {
+    OFF           = 0,
+    PHASE         = 1,
+    PHASE_TENSION = 2
+};
+
+static inline const char* dyn_gate_mode_name(DynGateMode dm) noexcept {
+    switch (dm) {
+        case DynGateMode::OFF:           return "off";
+        case DynGateMode::PHASE:         return "phase";
+        case DynGateMode::PHASE_TENSION: return "phase_tension";
+    }
+    return "off";
+}
+
+// Per-model calibrated Multi-ProbCut table (4 depth pairs x 60 plies = 2.88 KiB, L1D-resident!)
+struct MpcCalEntry {
+    float inv_slope       = 1.0f;   // 1.0f / clamp(slope, 0.85, 1.15)
+    float intercept_units = 0.0f;   // intercept_discs * score_scale
+    float sigma_units     = 256.0f; // clamp(sigma_discs, 0.80, 6.00) * score_scale
+};
+
+struct MpcCalTable {
+    bool        loaded = false;
+    MpcCalEntry table[4][NUM_PLIES]{}; // index 0..3 -> d_shallow = 1..4 (d_deep = 5..8)
+};
+
 enum class SearchLimitMode : int {
     DEPTH = 0,
     NODES = 1,
@@ -147,11 +178,17 @@ public:
     bool          use_mpc_        = false;
     double        mpc_t_          = 1.80;
     bool          mpc_pure_v64_   = false; // Default OFF: fair gated WACA_G2 + TT write on MPC probes!
+    MpcCalTable   mpc_cal_{};              // Optional model-specific calibrated MPC table (L1D-resident)
     MoveOrderMode mo_mode_        = MoveOrderMode::STATIC;
     GateMode      gate_mode_      = GateMode::SAFE_BND;
-    int32_t       m25_units_      = 320; // 2.5 discs * 128
-    int32_t       m3_units_       = 192; // 1.5 discs * 128
-    int32_t       tt_guard_units_ = 576; // 4.5 discs * 128 (used by GateMode::WIDE_SAFE_BND)
+    DynGateMode   dyn_gate_mode_  = DynGateMode::OFF;
+    double        dyn_r25_k_      = 0.50;
+    int32_t       dyn_r25_q4_     = 0;     // round(dyn_r25_k * 16) when PHASE_TENSION else 0
+    int32_t       m25_units_      = 320;   // 2.5 discs * 128
+    int32_t       m3_units_       = 192;   // 1.5 discs * 128
+    int32_t       tt_guard_units_ = 576;   // 4.5 discs * 128 (used by GateMode::WIDE_SAFE_BND)
+    int32_t       m25_ply_[NUM_PLIES]{};   // Precomputed 60-ply Stage 1->2.5 margins (0 ns lookup!)
+    int32_t       m3_ply_[NUM_PLIES]{};    // Precomputed 60-ply Stage 2.5->3 margins (0 ns lookup!)
 
     // B4_HYBRID Killer (2 slots per ply) & History (2 sides x 64 sq) tables
     uint8_t  killer_[64][2]{};
@@ -176,6 +213,7 @@ public:
         : model_(model), pt_(get_pattern_tables()), zk_(get_zobrist()), endgame_empties_(endgame_empties) {
         allocate_tt(tt_mb);
         clear_heuristics();
+        rebuild_gate_tables();
     }
 
     void set_mpc(bool enable, double t_val = 1.80) noexcept {
@@ -191,12 +229,138 @@ public:
         mo_mode_ = mo;
     }
 
+    void rebuild_gate_tables() noexcept {
+        if (dyn_gate_mode_ == DynGateMode::OFF) {
+            for (int p = 0; p < NUM_PLIES; ++p) {
+                m25_ply_[p] = m25_units_;
+                m3_ply_[p]  = m3_units_;
+            }
+            dyn_r25_q4_ = 0;
+        } else {
+            for (int p = 0; p < NUM_PLIES; ++p) {
+                double mult = 1.00;
+                if (p <= 15) {
+                    mult = 0.85;
+                } else if (p <= 27) {
+                    mult = 0.85 + 0.30 * static_cast<double>(p - 15) / 12.0;
+                } else if (p <= 47) {
+                    mult = 1.15;
+                } else {
+                    mult = 1.00;
+                }
+                const int32_t m25_p = static_cast<int32_t>(std::lround(static_cast<double>(m25_units_) * mult));
+                const int32_t m3_p  = static_cast<int32_t>(std::lround(static_cast<double>(m3_units_)  * mult));
+                m25_ply_[p] = std::clamp<int32_t>(m25_p, 0, tt_guard_units_);
+                m3_ply_[p]  = std::clamp<int32_t>(m3_p,  0, tt_guard_units_);
+            }
+            dyn_r25_q4_ = (dyn_gate_mode_ == DynGateMode::PHASE_TENSION)
+                ? static_cast<int32_t>(std::lround(std::max(0.0, dyn_r25_k_) * 16.0))
+                : 0;
+        }
+    }
+
     void set_waca_gate(GateMode gm, double m25_discs, double m3_discs, double tt_guard_discs = 4.5) noexcept {
         gate_mode_      = gm;
         const double sc = static_cast<double>(model_->score_scale);
         m25_units_      = static_cast<int32_t>(m25_discs * sc + 0.5);
         m3_units_       = static_cast<int32_t>(m3_discs * sc + 0.5);
         tt_guard_units_ = static_cast<int32_t>(tt_guard_discs * sc + 0.5);
+        rebuild_gate_tables();
+    }
+
+    void set_dyn_gate(DynGateMode dm, double r25_k = 0.50) noexcept {
+        dyn_gate_mode_ = dm;
+        dyn_r25_k_     = r25_k;
+        rebuild_gate_tables();
+    }
+
+    void clear_mpc_calibration() noexcept {
+        mpc_cal_.loaded = false;
+    }
+
+    // Load per-model MPC calibration CSV:
+    //   d_shallow,d_deep,ply_lo,ply_hi,ply_center,n,slope,intercept,sigma,r2
+    // Builds piecewise-linear interpolated 4 x 60 L1D lookup table (d_sh = 1..4).
+    bool load_mpc_calibration(const std::string& csv_path, std::string* err_msg = nullptr) {
+        auto fail = [&](const std::string& msg) -> bool {
+            if (err_msg) *err_msg = msg;
+            return false;
+        };
+        std::ifstream ifs(csv_path);
+        if (!ifs) return fail("Cannot open MPC calibration CSV: " + csv_path);
+
+        struct CalPt {
+            double ply_center;
+            double slope;
+            double intercept;
+            double sigma;
+        };
+        std::vector<CalPt> pts[4];
+        std::string line;
+        while (std::getline(ifs, line)) {
+            if (line.empty()) continue;
+            if (line.rfind("d_shallow", 0) == 0) continue; // header
+            std::stringstream ss(line);
+            std::string tok;
+            std::vector<std::string> cols;
+            while (std::getline(ss, tok, ',')) cols.push_back(tok);
+            if (cols.size() < 9) continue;
+
+            const int d_sh = std::atoi(cols[0].c_str());
+            if (d_sh < 1 || d_sh > 4) continue;
+            const double ply_c = std::atof(cols[4].c_str());
+            const double slope = std::atof(cols[6].c_str());
+            const double bias  = std::atof(cols[7].c_str());
+            const double sig   = std::atof(cols[8].c_str());
+            if (!std::isfinite(ply_c) || !std::isfinite(slope) || !std::isfinite(bias) || !std::isfinite(sig)) {
+                continue;
+            }
+            pts[d_sh - 1].push_back({ply_c, slope, bias, sig});
+        }
+
+        const double sc = static_cast<double>(model_->score_scale);
+        for (int d_idx = 0; d_idx < 4; ++d_idx) {
+            auto& vec = pts[d_idx];
+            if (vec.empty()) {
+                return fail("Missing calibration rows for d_shallow=" + std::to_string(d_idx + 1) + " in " + csv_path);
+            }
+            std::sort(vec.begin(), vec.end(), [](const CalPt& a, const CalPt& b) {
+                return a.ply_center < b.ply_center;
+            });
+            for (int p = 0; p < NUM_PLIES; ++p) {
+                const double pf = static_cast<double>(p);
+                double sl = vec.front().slope;
+                double bi = vec.front().intercept;
+                double sg = vec.front().sigma;
+                if (pf <= vec.front().ply_center) {
+                    sl = vec.front().slope;
+                    bi = vec.front().intercept;
+                    sg = vec.front().sigma;
+                } else if (pf >= vec.back().ply_center) {
+                    sl = vec.back().slope;
+                    bi = vec.back().intercept;
+                    sg = vec.back().sigma;
+                } else {
+                    for (size_t k = 0; k + 1 < vec.size(); ++k) {
+                        if (pf >= vec[k].ply_center && pf <= vec[k + 1].ply_center) {
+                            const double denom = vec[k + 1].ply_center - vec[k].ply_center;
+                            const double t = (denom > 1e-9) ? ((pf - vec[k].ply_center) / denom) : 0.0;
+                            sl = vec[k].slope     + t * (vec[k + 1].slope     - vec[k].slope);
+                            bi = vec[k].intercept + t * (vec[k + 1].intercept - vec[k].intercept);
+                            sg = vec[k].sigma     + t * (vec[k + 1].sigma     - vec[k].sigma);
+                            break;
+                        }
+                    }
+                }
+                const double sl_c = std::clamp(sl, 0.85, 1.15);
+                const double sg_c = std::clamp(sg, 0.80, 6.00);
+                mpc_cal_.table[d_idx][p].inv_slope       = static_cast<float>(1.0 / sl_c);
+                mpc_cal_.table[d_idx][p].intercept_units = static_cast<float>(bi * sc);
+                mpc_cal_.table[d_idx][p].sigma_units     = static_cast<float>(sg_c * sc);
+            }
+        }
+        mpc_cal_.loaded = true;
+        return true;
     }
 
     static inline double mpc_sigma_discs(int d_sh, int ply) noexcept {
@@ -398,9 +562,12 @@ public:
         if (depth <= 0) {
             if (in_mpc_probe) stat_mpc_leaves_++;
             else              stat_main_leaves_++;
+            const int cply = std::clamp(ply, 0, NUM_PLIES - 1);
             return model_->evaluate_search(pt_.meta, idx, B, W, stm, ply, alpha, beta,
-                                           (in_mpc_probe && mpc_pure_v64_), gate_mode_, m25_units_, m3_units_,
-                                           stat_s25_runs_, stat_s3_runs_, tt_guard_units_);
+                                           (in_mpc_probe && mpc_pure_v64_), gate_mode_,
+                                           m25_ply_[cply], m3_ply_[cply],
+                                           stat_s25_runs_, stat_s3_runs_, tt_guard_units_,
+                                           dyn_r25_q4_);
         }
 
         uint8_t tt_move = 64;
@@ -417,16 +584,28 @@ public:
             }
         }
 
-        // Standard Multi-ProbCut (100% identical logic across all models; WACA_G2 probes use MPC-PureV64!)
+        // Standard / Calibrated Multi-ProbCut (100% fair per-model Buro regression when mpc_cal_.loaded)
         if (use_mpc_ && !out_best_move && !in_mpc_probe &&
             beta == alpha + 1 && depth >= 5 && empties > endgame_empties_ + 4) {
             const int d_sh = depth - 4;
-            const double sig = mpc_sigma_discs(d_sh, ply);
-            const int32_t bound_delta = static_cast<int32_t>(
-                mpc_t_ * sig * static_cast<double>(model_->score_scale) + 0.5);
+            int32_t hi = 0;
+            int32_t lo = 0;
+            if (mpc_cal_.loaded) {
+                const int d_idx = std::clamp(d_sh, 1, 4) - 1;
+                const int cply  = std::clamp(ply, 0, NUM_PLIES - 1);
+                const MpcCalEntry& cal = mpc_cal_.table[d_idx][cply];
+                const float delta = static_cast<float>(mpc_t_) * cal.sigma_units;
+                hi = static_cast<int32_t>(std::lround((static_cast<float>(beta)  - cal.intercept_units + delta) * cal.inv_slope));
+                lo = static_cast<int32_t>(std::lround((static_cast<float>(alpha) - cal.intercept_units - delta) * cal.inv_slope));
+            } else {
+                const double sig = mpc_sigma_discs(d_sh, ply);
+                const int32_t bound_delta = static_cast<int32_t>(
+                    mpc_t_ * sig * static_cast<double>(model_->score_scale) + 0.5);
+                hi = beta + bound_delta;
+                lo = alpha - bound_delta;
+            }
             stat_mpc_tries_++;
 
-            const int32_t hi = beta + bound_delta;
             if (hi < SEARCH_INF / 2) {
                 const int32_t v_sh = pvs_midgame(B, W, stm, ply, d_sh, hash, idx,
                                                  hi - 1, hi, prev_pass, nullptr, true);
@@ -436,7 +615,6 @@ public:
                     return beta;
                 }
             }
-            const int32_t lo = alpha - bound_delta;
             if (lo > -SEARCH_INF / 2) {
                 const int32_t v_sh = pvs_midgame(B, W, stm, ply, d_sh, hash, idx,
                                                  lo, lo + 1, prev_pass, nullptr, true);

@@ -153,11 +153,16 @@ static void print_usage(const char* prog) {
     std::printf("  --tt-mb <MB>                  TT size per player in MiB (default: 64)\n");
     std::printf("  --mpc / --no-mpc              Enable/disable standard Multi-ProbCut (default: off)\n");
     std::printf("  --mpc-t <val>                 MPC sigma multiplier (default: 1.80)\n");
+    std::printf("  --mpc-cal <csv>               Load per-model MPC calibration CSV for both P1 and P2\n");
+    std::printf("  --mpc-cal-p1 <csv>            Load MPC calibration CSV for P1 only\n");
+    std::printf("  --mpc-cal-p2 <csv>            Load MPC calibration CSV for P2 only\n");
     std::printf("  --mpc-pure-v64 / --no-mpc-pure-v64  Use Tier-1 V1 only on MPC probe leaves (default: off)\n");
     std::printf("  --m25 <discs>                 WACA-G2 Stage 1->2.5 gate margin in discs (default: 2.5)\n");
     std::printf("  --m3 <discs>                  WACA-G2 Stage 2.5->3 gate margin in discs (default: 1.5)\n");
     std::printf("  --tt-guard <discs>            WIDE_SAFE_BND TT safety margin in discs (default: 4.5)\n");
     std::printf("  --gate-mode safe_bnd|fail_hard|full|wide_safe_bnd  WACA-G2 gating mode (default: safe_bnd)\n");
+    std::printf("  --dyn-gate off|phase|phase_tension  Phase & tension dynamic gating (default: off)\n");
+    std::printf("  --dyn-r25-k <val>             Stage 2.5 tension slope for phase_tension (default: 0.50)\n");
     std::printf("  --mo static|b4_hybrid         Move ordering applied identically to both players (default: static)\n");
     std::printf("  --mo-p1 static|b4_hybrid      Override P1 move ordering only (for MO ablation tests)\n");
     std::printf("  --mo-p2 static|b4_hybrid      Override P2 move ordering only (for MO ablation tests)\n");
@@ -169,8 +174,10 @@ int main(int argc, char** argv) {
     std::string p1_path, p2_path, csv_path;
     std::string mode_str      = "depth";
     std::string gate_mode_str = "safe_bnd";
+    std::string dyn_gate_str  = "off";
     std::string mo_str        = "static";
     std::string mo_p1_str, mo_p2_str;
+    std::string mpc_cal_all, mpc_cal_p1, mpc_cal_p2;
     int64_t limit_val         = 4;
     int num_pairs             = 20;
     int opening_plies         = 8;
@@ -182,6 +189,7 @@ int main(int argc, char** argv) {
     double m25_discs          = 2.5;
     double m3_discs           = 1.5;
     double tt_guard_discs     = 4.5;
+    double dyn_r25_k          = 0.50;
     uint64_t seed             = 20261125ULL;
 
     for (int i = 1; i < argc; ++i) {
@@ -199,10 +207,15 @@ int main(int argc, char** argv) {
         else if (arg == "--mpc-pure-v64")                    mpc_pure_v64 = true;
         else if (arg == "--no-mpc-pure-v64")                 mpc_pure_v64 = false;
         else if (arg == "--mpc-t" && i + 1 < argc)           mpc_t = std::atof(argv[++i]);
+        else if (arg == "--mpc-cal" && i + 1 < argc)         mpc_cal_all = argv[++i];
+        else if (arg == "--mpc-cal-p1" && i + 1 < argc)      mpc_cal_p1 = argv[++i];
+        else if (arg == "--mpc-cal-p2" && i + 1 < argc)      mpc_cal_p2 = argv[++i];
         else if (arg == "--m25" && i + 1 < argc)             m25_discs = std::atof(argv[++i]);
         else if (arg == "--m3" && i + 1 < argc)              m3_discs = std::atof(argv[++i]);
         else if (arg == "--tt-guard" && i + 1 < argc)        tt_guard_discs = std::atof(argv[++i]);
         else if (arg == "--gate-mode" && i + 1 < argc)       gate_mode_str = argv[++i];
+        else if (arg == "--dyn-gate" && i + 1 < argc)        dyn_gate_str = argv[++i];
+        else if (arg == "--dyn-r25-k" && i + 1 < argc)       dyn_r25_k = std::atof(argv[++i]);
         else if (arg == "--mo" && i + 1 < argc)              mo_str = argv[++i];
         else if (arg == "--mo-p1" && i + 1 < argc)           mo_p1_str = argv[++i];
         else if (arg == "--mo-p2" && i + 1 < argc)           mo_p2_str = argv[++i];
@@ -231,6 +244,12 @@ int main(int argc, char** argv) {
     else if (gate_mode_str == "wide_safe_bnd") gate_mode = GateMode::WIDE_SAFE_BND;
     else { std::fprintf(stderr, "ERROR: Invalid --gate-mode '%s'\n", gate_mode_str.c_str()); return 1; }
 
+    DynGateMode dyn_gate = DynGateMode::OFF;
+    if (dyn_gate_str == "off")                dyn_gate = DynGateMode::OFF;
+    else if (dyn_gate_str == "phase")         dyn_gate = DynGateMode::PHASE;
+    else if (dyn_gate_str == "phase_tension") dyn_gate = DynGateMode::PHASE_TENSION;
+    else { std::fprintf(stderr, "ERROR: Invalid --dyn-gate '%s' (expected off|phase|phase_tension)\n", dyn_gate_str.c_str()); return 1; }
+
     auto parse_mo = [](const std::string& s, MoveOrderMode& out) -> bool {
         if (s == "static")         { out = MoveOrderMode::STATIC; return true; }
         if (s == "b4_hybrid")      { out = MoveOrderMode::B4_HYBRID; return true; }
@@ -245,6 +264,9 @@ int main(int argc, char** argv) {
     const std::string mo_label = (mo_p1 == mo_p2)
         ? std::string(move_order_mode_name(mo_p1))
         : (std::string(move_order_mode_name(mo_p1)) + "_vs_" + move_order_mode_name(mo_p2));
+
+    const std::string cal1_path = mpc_cal_p1.empty() ? mpc_cal_all : mpc_cal_p1;
+    const std::string cal2_path = mpc_cal_p2.empty() ? mpc_cal_all : mpc_cal_p2;
 
     LoadedModel m1, m2;
     std::string err;
@@ -261,6 +283,25 @@ int main(int argc, char** argv) {
     eng2.set_move_order_mode(mo_p2);
     eng1.set_waca_gate(gate_mode, m25_discs, m3_discs, tt_guard_discs);
     eng2.set_waca_gate(gate_mode, m25_discs, m3_discs, tt_guard_discs);
+    eng1.set_dyn_gate(dyn_gate, dyn_r25_k);
+    eng2.set_dyn_gate(dyn_gate, dyn_r25_k);
+
+    if (!cal1_path.empty()) {
+        if (!eng1.load_mpc_calibration(cal1_path, &err)) {
+            std::fprintf(stderr, "ERROR loading --mpc-cal-p1: %s\n", err.c_str());
+            return 1;
+        }
+    }
+    if (!cal2_path.empty()) {
+        if (!eng2.load_mpc_calibration(cal2_path, &err)) {
+            std::fprintf(stderr, "ERROR loading --mpc-cal-p2: %s\n", err.c_str());
+            return 1;
+        }
+    }
+    const std::string mpc_cal_label =
+        (eng1.mpc_cal_.loaded && eng2.mpc_cal_.loaded) ? "calibrated" :
+        (eng1.mpc_cal_.loaded && !eng2.mpc_cal_.loaded) ? "cal_vs_legacy" :
+        (!eng1.mpc_cal_.loaded && eng2.mpc_cal_.loaded) ? "legacy_vs_cal" : "legacy";
 
     auto openings = generate_openings(num_pairs, opening_plies, seed);
 
@@ -272,11 +313,12 @@ int main(int argc, char** argv) {
     std::printf("=== P2C-64 Pure-Scalar PVS Paired Match Engine ===\n");
     std::printf("P1 (%s): %s\n", eval_mode_name(m1.mode), p1_path.c_str());
     std::printf("P2 (%s): %s\n", eval_mode_name(m2.mode), p2_path.c_str());
-    std::printf("Config: mode=%s limit=%lld | pairs=%d (%d games) | open=%d ply | endgame=%d empties | TT=%zu MiB | MPC=%s(t=%.2f) | mpc_pure_v64=%s | mo=%s | gate=%s(m25=%.2f,m3=%.2f,tt_guard=%.2f)\n",
+    std::printf("Config: mode=%s limit=%lld | pairs=%d (%d games) | open=%d ply | endgame=%d empties | TT=%zu MiB | MPC=%s(t=%.2f,cal=%s) | mpc_pure_v64=%s | mo=%s | gate=%s(m25=%.2f,m3=%.2f,tt_guard=%.2f,dyn=%s[k=%.2f])\n",
                 mode_str.c_str(), static_cast<long long>(limit_val), num_pairs, num_pairs * 2,
                 opening_plies, endgame_empties, tt_mb,
-                use_mpc ? "ON" : "OFF", mpc_t, mpc_pure_v64 ? "ON" : "OFF",
-                mo_label.c_str(), gate_mode_name(gate_mode), m25_discs, m3_discs, tt_guard_discs);
+                use_mpc ? "ON" : "OFF", mpc_t, mpc_cal_label.c_str(), mpc_pure_v64 ? "ON" : "OFF",
+                mo_label.c_str(), gate_mode_name(gate_mode), m25_discs, m3_discs, tt_guard_discs,
+                dyn_gate_mode_name(dyn_gate), dyn_r25_k);
 
     for (int i = 0; i < num_pairs; ++i) {
         int d1 = play_game(openings[static_cast<size_t>(i)], eng1, eng2, st1, st2, mode, limit_val);
@@ -341,7 +383,7 @@ int main(int argc, char** argv) {
         std::ofstream ofs(csv_path, std::ios::app);
         if (ofs) {
             if (!exists) {
-                ofs << "p1_mode,p2_mode,mode,limit,mpc,gate_mode,m25,m3,games,wins,draws,losses,win_rate,elo,elo_ci95,avg_disc_diff,p1_knps,p2_knps,p1_depth,p2_depth,p1_s25_pct,p1_s3_pct,p1_mpc_cut_pct,p2_mpc_cut_pct,mpc_pure_v64,tt_guard,mo_mode\n";
+                ofs << "p1_mode,p2_mode,mode,limit,mpc,gate_mode,m25,m3,games,wins,draws,losses,win_rate,elo,elo_ci95,avg_disc_diff,p1_knps,p2_knps,p1_depth,p2_depth,p1_s25_pct,p1_s3_pct,p1_mpc_cut_pct,p2_mpc_cut_pct,mpc_pure_v64,tt_guard,mo_mode,mpc_cal,dyn_gate\n";
             }
             ofs << eval_mode_name(m1.mode) << "," << eval_mode_name(m2.mode) << ","
                 << mode_str << "," << limit_val << "," << (use_mpc ? 1 : 0) << ","
@@ -350,7 +392,8 @@ int main(int argc, char** argv) {
                 << win_rate << "," << elo_mid << "," << elo_err << "," << avg_diff << ","
                 << (nps1 * 1e-3) << "," << (nps2 * 1e-3) << "," << avg_d1 << "," << avg_d2 << ","
                 << p1_s25 << "," << p1_s3 << "," << p1_mpc << "," << p2_mpc << ","
-                << (mpc_pure_v64 ? 1 : 0) << "," << tt_guard_discs << "," << mo_label << "\n";
+                << (mpc_pure_v64 ? 1 : 0) << "," << tt_guard_discs << "," << mo_label << ","
+                << mpc_cal_label << "," << dyn_gate_mode_name(dyn_gate) << "\n";
         }
     }
     return 0;

@@ -54,19 +54,29 @@ static RegStats fit_linear_regression(const std::vector<double>& x, const std::v
 
 static void print_usage(const char* prog) {
     std::printf("Usage: %s --data <val.bin> --models <m1.p2c> [m2.p2c ...] [options]\n", prog);
-    std::printf("  --num-pos <N>    Max unseen positions to sample (default: 2000)\n");
-    std::printf("  --shallow <d>    Shallow search depth (default: 2)\n");
-    std::printf("  --deep <d>       Deep search depth (default: 6)\n");
-    std::printf("  --tt-mb <MB>     TT size in MiB (default: 64)\n");
-    std::printf("  --m25 <discs>    WACA-G2 m25 gate margin (default: 2.5)\n");
-    std::printf("  --m3 <discs>     WACA-G2 m3 gate margin (default: 1.5)\n");
-    std::printf("  --tt-guard <d>   WIDE_SAFE_BND TT safety margin (default: 4.5)\n");
-    std::printf("  --gate-mode <m>  safe_bnd|fail_hard|full|wide_safe_bnd (default: safe_bnd)\n");
-    std::printf("  --csv <path>     Write MPC sigma comparison CSV\n");
+    std::printf("  --num-pos <N>          Max unseen positions to sample (default: 2000)\n");
+    std::printf("  --shallow <d>          Shallow search depth (default: 2)\n");
+    std::printf("  --deep <d>             Deep search depth (default: 6)\n");
+    std::printf("  --tt-mb <MB>           TT size in MiB (default: 64)\n");
+    std::printf("  --m25 <discs>          WACA-G2 m25 gate margin (default: 2.5)\n");
+    std::printf("  --m3 <discs>           WACA-G2 m3 gate margin (default: 1.5)\n");
+    std::printf("  --tt-guard <d>         WIDE_SAFE_BND TT safety margin (default: 4.5)\n");
+    std::printf("  --gate-mode <m>        safe_bnd|fail_hard|full|wide_safe_bnd (default: safe_bnd)\n");
+    std::printf("  --csv <path>           Write MPC sigma comparison CSV\n");
+    std::printf("  --calibrate-out <path> Auto-calibrate all 4 pairs (1,5)..(4,8) x 6 ply buckets to CSV\n");
+}
+
+static std::string make_cal_path(const std::string& base, const char* mode_name, size_t total_models) {
+    if (total_models <= 1) return base;
+    std::string prefix = base;
+    if (prefix.size() >= 4 && prefix.substr(prefix.size() - 4) == ".csv") {
+        prefix.resize(prefix.size() - 4);
+    }
+    return prefix + "_" + mode_name + ".csv";
 }
 
 int main(int argc, char** argv) {
-    std::string data_path, csv_path, gate_mode_str = "safe_bnd";
+    std::string data_path, csv_path, calibrate_out, gate_mode_str = "safe_bnd";
     std::vector<std::string> model_paths;
     size_t num_pos    = 2000;
     int d_shallow     = 2;
@@ -78,16 +88,17 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--data" && i + 1 < argc)           data_path = argv[++i];
-        else if (arg == "--num-pos" && i + 1 < argc)   num_pos = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
-        else if (arg == "--shallow" && i + 1 < argc)   d_shallow = std::atoi(argv[++i]);
-        else if (arg == "--deep" && i + 1 < argc)      d_deep = std::atoi(argv[++i]);
-        else if (arg == "--tt-mb" && i + 1 < argc)     tt_mb = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
-        else if (arg == "--m25" && i + 1 < argc)       m25_d = std::atof(argv[++i]);
-        else if (arg == "--m3" && i + 1 < argc)        m3_d = std::atof(argv[++i]);
-        else if (arg == "--tt-guard" && i + 1 < argc)  tt_guard_d = std::atof(argv[++i]);
-        else if (arg == "--gate-mode" && i + 1 < argc) gate_mode_str = argv[++i];
-        else if (arg == "--csv" && i + 1 < argc)       csv_path = argv[++i];
+        if (arg == "--data" && i + 1 < argc)               data_path = argv[++i];
+        else if (arg == "--num-pos" && i + 1 < argc)       num_pos = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
+        else if (arg == "--shallow" && i + 1 < argc)       d_shallow = std::atoi(argv[++i]);
+        else if (arg == "--deep" && i + 1 < argc)          d_deep = std::atoi(argv[++i]);
+        else if (arg == "--tt-mb" && i + 1 < argc)         tt_mb = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
+        else if (arg == "--m25" && i + 1 < argc)           m25_d = std::atof(argv[++i]);
+        else if (arg == "--m3" && i + 1 < argc)            m3_d = std::atof(argv[++i]);
+        else if (arg == "--tt-guard" && i + 1 < argc)      tt_guard_d = std::atof(argv[++i]);
+        else if (arg == "--gate-mode" && i + 1 < argc)     gate_mode_str = argv[++i];
+        else if (arg == "--csv" && i + 1 < argc)           csv_path = argv[++i];
+        else if (arg == "--calibrate-out" && i + 1 < argc) calibrate_out = argv[++i];
         else if (arg == "--models") {
             while (i + 1 < argc && argv[i + 1][0] != '-') {
                 model_paths.emplace_back(argv[++i]);
@@ -128,6 +139,120 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ------------------------------------------------------------------------
+    // Mode A: Full 4-pair (1,5)..(4,8) x 6-ply-bucket Buro MPC Auto-Calibration
+    // ------------------------------------------------------------------------
+    if (!calibrate_out.empty()) {
+        static constexpr int PAIRS[4][2]   = {{1, 5}, {2, 6}, {3, 7}, {4, 8}};
+        static constexpr int BKT_LO[6]     = { 0, 10, 20, 30, 40, 50};
+        static constexpr int BKT_HI[6]     = { 9, 19, 29, 39, 49, 59};
+        static constexpr int BKT_CENTER[6] = { 5, 15, 25, 35, 45, 54};
+        static constexpr size_t MIN_BKT_N  = 25;
+
+        std::printf("=== P2C-64 v3.4 Multi-ProbCut Auto-Calibrator (4 pairs x 6 ply buckets) ===\n");
+        std::printf("Dataset : %s (%zu sampled positions out of %zu)\n", data_path.c_str(), samples.size(), total_rec);
+        std::printf("Gate    : %s (m25=%.2f, m3=%.2f, tt_guard=%.2f)\n", gate_mode_str.c_str(), m25_d, m3_d, tt_guard_d);
+
+        for (const auto& mp : model_paths) {
+            LoadedModel m;
+            std::string err;
+            if (!load_p2c_model(mp, m, &err)) {
+                std::fprintf(stderr, "ERROR loading '%s': %s\n", mp.c_str(), err.c_str());
+                return 1;
+            }
+            PVSEngine eng(&m, tt_mb, 0);
+            eng.set_waca_gate(gm, m25_d, m3_d, tt_guard_d);
+            const double inv_scale = 1.0 / static_cast<double>(m.score_scale);
+
+            std::vector<double> ax[4], ay[4];
+            std::vector<double> bx[4][6], by[4][6];
+
+            for (const auto& s : samples) {
+                if (s.ply > 59) continue;
+                const int empties = 60 - static_cast<int>(s.ply);
+                if (empties <= 5) continue;
+
+                double v[9]{};
+                bool valid[9]{};
+                const int max_d = std::min(8, empties - 1);
+                for (int d = 1; d <= max_d; ++d) {
+                    eng.clear_tt();
+                    v[d] = static_cast<double>(eng.eval_fixed_depth(s.black, s.white, s.stm, d, false)) * inv_scale;
+                    valid[d] = true;
+                }
+
+                const int bkt = std::min(5, static_cast<int>(s.ply) / 10);
+                for (int pi = 0; pi < 4; ++pi) {
+                    const int dsh = PAIRS[pi][0];
+                    const int ddp = PAIRS[pi][1];
+                    if (valid[dsh] && valid[ddp]) {
+                        ax[pi].push_back(v[dsh]);
+                        ay[pi].push_back(v[ddp]);
+                        bx[pi][bkt].push_back(v[dsh]);
+                        by[pi][bkt].push_back(v[ddp]);
+                    }
+                }
+            }
+
+            const std::string out_csv = make_cal_path(calibrate_out, eval_mode_name(m.mode), model_paths.size());
+            std::ofstream ofs(out_csv, std::ios::trunc);
+            if (!ofs) {
+                std::fprintf(stderr, "ERROR: Cannot write calibration CSV '%s'\n", out_csv.c_str());
+                return 1;
+            }
+            ofs << "d_shallow,d_deep,ply_lo,ply_hi,ply_center,n,slope,intercept,sigma,r2\n";
+
+            std::printf("\n--- Model: %s (%s) -> %s ---\n", eval_mode_name(m.mode), mp.c_str(), out_csv.c_str());
+            std::printf("Pair  | Ply    |    N |  Slope |    Bias |  Sigma |    R^2 | Note\n");
+            std::printf("------+--------+------+--------+---------+--------+--------+---------\n");
+
+            for (int pi = 0; pi < 4; ++pi) {
+                const int dsh = PAIRS[pi][0];
+                const int ddp = PAIRS[pi][1];
+                RegStats r_all = fit_linear_regression(ax[pi], ay[pi]);
+
+                RegStats fallback{};
+                if (r_all.n >= MIN_BKT_N && std::isfinite(r_all.slope) && std::isfinite(r_all.sigma) && r_all.sigma > 1e-6) {
+                    fallback = r_all;
+                } else {
+                    fallback.slope     = 1.0;
+                    fallback.intercept = 0.0;
+                    fallback.sigma     = PVSEngine::mpc_sigma_discs(dsh, 25);
+                    fallback.r2        = 0.90;
+                }
+
+                RegStats last_valid = fallback;
+                for (int b = 0; b < 6; ++b) {
+                    RegStats st = fit_linear_regression(bx[pi][b], by[pi][b]);
+                    bool used_fallback = false;
+                    if (st.n >= MIN_BKT_N && std::isfinite(st.slope) && std::isfinite(st.intercept) &&
+                        std::isfinite(st.sigma) && st.sigma > 1e-6) {
+                        last_valid = st;
+                    } else {
+                        st.slope     = last_valid.slope;
+                        st.intercept = last_valid.intercept;
+                        st.sigma     = last_valid.sigma;
+                        st.r2        = last_valid.r2;
+                        used_fallback = true;
+                    }
+
+                    ofs << dsh << "," << ddp << "," << BKT_LO[b] << "," << BKT_HI[b] << ","
+                        << BKT_CENTER[b] << "," << st.n << ","
+                        << st.slope << "," << st.intercept << "," << st.sigma << "," << st.r2 << "\n";
+
+                    std::printf("d%d->d%d | %2d..%2d | %4zu | %6.3f | %+7.3f | %6.3f | %6.3f | %s\n",
+                                dsh, ddp, BKT_LO[b], BKT_HI[b], st.n,
+                                st.slope, st.intercept, st.sigma, st.r2,
+                                used_fallback ? "fallback" : "fit");
+                }
+            }
+        }
+        return 0;
+    }
+
+    // ------------------------------------------------------------------------
+    // Mode B: Standard Single-Pair MPC Sigma Comparison (100% backward compatible)
+    // ------------------------------------------------------------------------
     std::printf("=== P2C-64 Multi-ProbCut (MPC) Sigma Measurer (depth %d -> %d) ===\n", d_shallow, d_deep);
     std::printf("Dataset : %s (%zu sampled positions out of %zu)\n\n", data_path.c_str(), samples.size(), total_rec);
     std::printf("%-28s | %8s | %8s | %8s | %8s | %6s | %6s | %6s\n",

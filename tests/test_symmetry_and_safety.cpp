@@ -1,10 +1,14 @@
 #include "p2c64_eval.hpp"
+#include "p2c64_search.hpp"
 
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
+#include <string>
 #include <vector>
 
 using namespace p2c64;
@@ -1029,8 +1033,230 @@ static void test_waca_g2_v33_overflow_safety() {
     std::printf("[PASS] Test 13: WACA_G2_V33(H=24) Extreme Boundary int32_t Overflow Safety (44-term sc_acc + 32->24->1, ply=23/27/34 exact int64_t match)\n");
 }
 
+static void test_v34_dynamic_gating() {
+    const PatternTables& pt = get_pattern_tables();
+    LoadedModel model;
+    model.mode        = EvalMode::WACA_G2_V33;
+    model.is_waca_v33 = true;
+    model.score_scale = 128.0f;
+    model.waca_v33    = std::make_unique<WacaG2V33Weights>();
+    model.waca_v33->mlp_hidden = 16;
+
+    PVSEngine eng(&model, 1, 10);
+    eng.set_waca_gate(GateMode::WIDE_SAFE_BND, 2.5, 1.5, 5.5);
+
+    // 1. DynGateMode::OFF -> flat m25=320, m3=192, dyn_r25_q4=0 across all 60 plies
+    eng.set_dyn_gate(DynGateMode::OFF, 0.50);
+    if (eng.dyn_r25_q4_ != 0) {
+        std::fprintf(stderr, "FAIL: DynGateMode::OFF dyn_r25_q4=%d != 0\n", eng.dyn_r25_q4_);
+        std::exit(1);
+    }
+    for (int p = 0; p < NUM_PLIES; ++p) {
+        if (eng.m25_ply_[p] != 320 || eng.m3_ply_[p] != 192) {
+            std::fprintf(stderr, "FAIL: DynGateMode::OFF ply=%d m25=%d m3=%d\n", p, eng.m25_ply_[p], eng.m3_ply_[p]);
+            std::exit(1);
+        }
+    }
+
+    // 2. DynGateMode::PHASE -> exact 0.85x / linear ramp / 1.15x / 1.00x schedule
+    eng.set_dyn_gate(DynGateMode::PHASE, 0.50);
+    if (eng.dyn_r25_q4_ != 0) {
+        std::fprintf(stderr, "FAIL: DynGateMode::PHASE dyn_r25_q4=%d != 0\n", eng.dyn_r25_q4_);
+        std::exit(1);
+    }
+    auto check_ply = [&](int p, int32_t exp25, int32_t exp3) {
+        if (eng.m25_ply_[p] != exp25 || eng.m3_ply_[p] != exp3) {
+            std::fprintf(stderr, "FAIL: DynGateMode::PHASE ply=%d got=(%d,%d) exp=(%d,%d)\n",
+                         p, eng.m25_ply_[p], eng.m3_ply_[p], exp25, exp3);
+            std::exit(1);
+        }
+    };
+    check_ply(0,  272, 163); // 0.85x
+    check_ply(15, 272, 163); // 0.85x
+    check_ply(21, 320, 192); // 1.00x midpoint
+    check_ply(27, 368, 221); // 1.15x
+    check_ply(28, 368, 221); // 1.15x
+    check_ply(47, 368, 221); // 1.15x
+    check_ply(48, 320, 192); // 1.00x
+    check_ply(59, 320, 192); // 1.00x
+
+    // Clamping to tt_guard_units when tt_guard < 1.15 * m25
+    eng.set_waca_gate(GateMode::WIDE_SAFE_BND, 2.5, 1.5, 2.6); // tt_guard = 333 < 368
+    for (int p = 0; p < NUM_PLIES; ++p) {
+        if (eng.m25_ply_[p] > eng.tt_guard_units_ || eng.m3_ply_[p] > eng.tt_guard_units_) {
+            std::fprintf(stderr, "FAIL: DynGateMode::PHASE exceeded tt_guard=%d at ply=%d (%d,%d)\n",
+                         eng.tt_guard_units_, p, eng.m25_ply_[p], eng.m3_ply_[p]);
+            std::exit(1);
+        }
+    }
+    if (eng.m25_ply_[30] != eng.tt_guard_units_) {
+        std::fprintf(stderr, "FAIL: DynGateMode::PHASE ply=30 not clamped to tt_guard=%d (got %d)\n",
+                     eng.tt_guard_units_, eng.m25_ply_[30]);
+        std::exit(1);
+    }
+
+    // 3. DynGateMode::PHASE_TENSION -> dyn_r25_q4 == 8 (k=0.50) expands m3_eff when |r25| is large,
+    //    while preserving WIDE_SAFE_BND safety invariant!
+    eng.set_waca_gate(GateMode::WIDE_SAFE_BND, 2.5, 1.5, 5.5);
+    eng.set_dyn_gate(DynGateMode::PHASE_TENSION, 0.50);
+    if (eng.dyn_r25_q4_ != 8) {
+        std::fprintf(stderr, "FAIL: DynGateMode::PHASE_TENSION dyn_r25_q4=%d != 8\n", eng.dyn_r25_q4_);
+        std::exit(1);
+    }
+
+    // Set synthetic Stage 2.5 bias so r25 = +256 (+2.0 discs) and Stage 3 MLP b2 so r_mlp = +128 (+1.0 disc)
+    const int ply = 30;
+    model.waca_v33->s25[ply].b = 256 * (1 << WACA_S25_SHIFT);
+    model.waca_v33->mlp[ply].b2 = 128 * (1 << WACA_MLP_S2);
+    const uint64_t B = (1ULL << rc(3, 4)) | (1ULL << rc(4, 3));
+    const uint64_t W = (1ULL << rc(3, 3)) | (1ULL << rc(4, 4));
+    uint16_t idx[NUM_PATTERNS];
+    pt.extract_indices(B, W, idx);
+
+    // v1 = 0, v25 = 0 + 256 = 256. Pick zero-window [alpha=500, beta=501]:
+    //   m25 = 512 (so v1=0 is within [500-512, 501+512] -> enters Stage 2.5)
+    //   Fixed m3 = 192: v25 = 256 < alpha - m3 = 308 -> gated OUT (s3=0, returns alpha=500 under WIDE_SAFE_BND)
+    //   Tension m3_eff = 192 + ((256 * 8) >> 4) = 192 + 128 = 320:
+    //     v25 = 256 >= alpha - m3_eff = 180 -> enters Stage 3 (s3=1, returns 0 + 256 + 128 = 384)!
+    uint64_t s25_fix = 0, s3_fix = 0;
+    const int32_t v_fix = eval_waca_g2_v33_gated(
+        *model.waca_v33, pt.meta, idx, B, W, +1, ply, 500, 501,
+        false, GateMode::WIDE_SAFE_BND, 512, 192, s25_fix, s3_fix, 704, 0);
+    uint64_t s25_ten = 0, s3_ten = 0;
+    const int32_t v_ten = eval_waca_g2_v33_gated(
+        *model.waca_v33, pt.meta, idx, B, W, +1, ply, 500, 501,
+        false, GateMode::WIDE_SAFE_BND, 512, 192, s25_ten, s3_ten, 704, 8);
+    if (s25_fix != 1 || s3_fix != 0 || v_fix != 500) {
+        std::fprintf(stderr, "FAIL: Fixed gate expected s25=1,s3=0,v=500 got s25=%llu,s3=%llu,v=%d\n",
+                     static_cast<unsigned long long>(s25_fix), static_cast<unsigned long long>(s3_fix), v_fix);
+        std::exit(1);
+    }
+    if (s25_ten != 1 || s3_ten != 1 || v_ten != 384) {
+        std::fprintf(stderr, "FAIL: Tension gate expected s25=1,s3=1,v=384 got s25=%llu,s3=%llu,v=%d\n",
+                     static_cast<unsigned long long>(s25_ten), static_cast<unsigned long long>(s3_ten), v_ten);
+        std::exit(1);
+    }
+
+    // Verify WIDE_SAFE_BND cutoff safety invariant even when tension triggers/gates out
+    // With v1=0, alpha=700, beta=701, m25=800, tt_guard=704: v25=256 < 700 - 320 = 380 -> gated out with v25 <= alpha
+    uint64_t s25_safe = 0, s3_safe = 0;
+    const int32_t v_safe = eval_waca_g2_v33_gated(
+        *model.waca_v33, pt.meta, idx, B, W, +1, ply, 700, 701,
+        false, GateMode::WIDE_SAFE_BND, 800, 192, s25_safe, s3_safe, 704, 8);
+    if (s3_safe != 0 || v_safe > 700) {
+        std::fprintf(stderr, "FAIL: WIDE_SAFE_BND low-cutoff invariant violated: s3=%llu v=%d > alpha=700\n",
+                     static_cast<unsigned long long>(s3_safe), v_safe);
+        std::exit(1);
+    }
+
+    std::printf("[PASS] Test 14: v3.4 Dynamic Gating (OFF / PHASE 0.85x..1.15x + tt_guard clamp / PHASE_TENSION |r25| expansion & WIDE_SAFE_BND safety)\n");
+}
+
+static void test_v34_mpc_calibration() {
+    LoadedModel model;
+    model.mode        = EvalMode::RAW_NTUPLE_64;
+    model.is_raw      = true;
+    model.score_scale = 128.0f;
+
+    PVSEngine eng(&model, 1, 10);
+    if (eng.mpc_cal_.loaded) {
+        std::fprintf(stderr, "FAIL: mpc_cal_.loaded should start false\n");
+        std::exit(1);
+    }
+
+    const std::string tmp_csv = "/tmp/test_mpc_cal_v34.csv";
+    {
+        std::ofstream ofs(tmp_csv);
+        ofs << "d_shallow,d_deep,ply_lo,ply_hi,ply_center,n,slope,intercept,sigma,r2\n";
+        // Include extreme slope/sigma values to test clamping [0.85, 1.15] & [0.80, 6.00]
+        // and linear ramp between ply_center=15 and ply_center=25.
+        for (int d_sh = 1; d_sh <= 4; ++d_sh) {
+            const int d_dp = d_sh + 4;
+            ofs << d_sh << "," << d_dp << ",0,9,5,100,0.70,-0.20,0.40,0.90\n";    // slope->0.85, sigma->0.80
+            ofs << d_sh << "," << d_dp << ",10,19,15,100,0.90,0.00,2.00,0.91\n";
+            ofs << d_sh << "," << d_dp << ",20,29,25,100,1.10,0.40,3.00,0.92\n";
+            ofs << d_sh << "," << d_dp << ",30,39,35,100,1.00,0.10,2.50,0.93\n";
+            ofs << d_sh << "," << d_dp << ",40,49,45,100,1.05,-0.10,3.50,0.94\n";
+            ofs << d_sh << "," << d_dp << ",50,59,54,100,1.30,0.50,8.00,0.95\n";  // slope->1.15, sigma->6.00
+        }
+    }
+
+    std::string err;
+    const bool ok = eng.load_mpc_calibration(tmp_csv, &err);
+    std::remove(tmp_csv.c_str());
+    if (!ok || !eng.mpc_cal_.loaded) {
+        std::fprintf(stderr, "FAIL: load_mpc_calibration failed: %s\n", err.c_str());
+        std::exit(1);
+    }
+
+    auto near_f = [](double a, double b, double tol = 1e-4) -> bool {
+        return std::fabs(a - b) <= tol;
+    };
+
+    for (int d_idx = 0; d_idx < 4; ++d_idx) {
+        // ply <= 5 clamped to first point (slope=0.85, intercept=-0.20*128=-25.6, sigma=0.80*128=102.4)
+        for (int p : {0, 3, 5}) {
+            const MpcCalEntry& e = eng.mpc_cal_.table[d_idx][p];
+            if (!near_f(e.inv_slope, 1.0 / 0.85) ||
+                !near_f(e.intercept_units, -0.20 * 128.0) ||
+                !near_f(e.sigma_units, 0.80 * 128.0)) {
+                std::fprintf(stderr, "FAIL: low-end clamp mismatch d_idx=%d ply=%d inv_s=%.6f b=%.4f sig=%.4f\n",
+                             d_idx, p, e.inv_slope, e.intercept_units, e.sigma_units);
+                std::exit(1);
+            }
+        }
+        // ply == 20: exact midpoint between ply_center=15 (0.90, 0.00, 2.00) and ply_center=25 (1.10, 0.40, 3.00)
+        // -> slope=1.00 (inv_slope=1.00), intercept=0.20*128=25.6, sigma=2.50*128=320.0
+        {
+            const MpcCalEntry& e = eng.mpc_cal_.table[d_idx][20];
+            if (!near_f(e.inv_slope, 1.0) ||
+                !near_f(e.intercept_units, 0.20 * 128.0) ||
+                !near_f(e.sigma_units, 2.50 * 128.0)) {
+                std::fprintf(stderr, "FAIL: midpoint ply=20 mismatch d_idx=%d inv_s=%.6f b=%.4f sig=%.4f\n",
+                             d_idx, e.inv_slope, e.intercept_units, e.sigma_units);
+                std::exit(1);
+            }
+        }
+        // ply >= 54 clamped to last point (slope=1.15, intercept=0.50*128=64.0, sigma=6.00*128=768.0)
+        for (int p : {54, 57, 59}) {
+            const MpcCalEntry& e = eng.mpc_cal_.table[d_idx][p];
+            if (!near_f(e.inv_slope, 1.0 / 1.15) ||
+                !near_f(e.intercept_units, 0.50 * 128.0) ||
+                !near_f(e.sigma_units, 6.00 * 128.0)) {
+                std::fprintf(stderr, "FAIL: high-end clamp mismatch d_idx=%d ply=%d inv_s=%.6f b=%.4f sig=%.4f\n",
+                             d_idx, p, e.inv_slope, e.intercept_units, e.sigma_units);
+                std::exit(1);
+            }
+        }
+    }
+
+    // Verify exact Buro threshold calculation at ply=20 (inv_slope=1.0, intercept=25.6, sigma=320.0)
+    {
+        const MpcCalEntry& cal = eng.mpc_cal_.table[1][20];
+        const double mpc_t = 1.5;
+        const int32_t alpha = 100, beta = 101;
+        const float delta = static_cast<float>(mpc_t) * cal.sigma_units; // 480.0
+        const int32_t hi = static_cast<int32_t>(std::lround((static_cast<float>(beta)  - cal.intercept_units + delta) * cal.inv_slope));
+        const int32_t lo = static_cast<int32_t>(std::lround((static_cast<float>(alpha) - cal.intercept_units - delta) * cal.inv_slope));
+        // hi = lround((101 - 25.6 + 480.0) * 1.0) = lround(555.4) = 555
+        // lo = lround((100 - 25.6 - 480.0) * 1.0) = lround(-405.6) = -406
+        if (hi != 555 || lo != -406) {
+            std::fprintf(stderr, "FAIL: Buro threshold mismatch hi=%d (exp 555) lo=%d (exp -406)\n", hi, lo);
+            std::exit(1);
+        }
+    }
+
+    eng.clear_mpc_calibration();
+    if (eng.mpc_cal_.loaded) {
+        std::fprintf(stderr, "FAIL: clear_mpc_calibration did not reset loaded flag\n");
+        std::exit(1);
+    }
+
+    std::printf("[PASS] Test 15: v3.4 MpcCalTable CSV Load, [0.85..1.15]/[0.80..6.00] Clamping, Piecewise-Linear Interp & Buro Thresholds\n");
+}
+
 int main() {
-    std::printf("=== P2C-64 v3.3 (Full PTM + WACA-G2 v3.0/v3.1/v3.2/v3.3): Symmetry, Identity & Overflow Suite ===\n");
+    std::printf("=== P2C-64 v3.4 (Full PTM + WACA-G2 v3.0..v3.3 + Calibrated MPC & Dynamic Gating): Safety & Unit Test Suite ===\n");
     auto positions = test_incremental_and_collect_positions();
 
     verify_raw_and_linear_identity(positions);
@@ -1053,6 +1279,8 @@ int main() {
     test_waca_g2_v32_overflow_safety();
     test_waca_g2_v33_16sym(positions, 16, 11011ULL);
     test_waca_g2_v33_overflow_safety();
+    test_v34_dynamic_gating();
+    test_v34_mpc_calibration();
     std::printf("=== ALL TESTS PASSED (0 ERRORS) ===\n");
     return 0;
 }
