@@ -460,6 +460,151 @@ int32_t waca_g2_v31_eval_file_batch_stages(const char*     p2c_path,
     return model.waca_v31->mlp_hidden;
 }
 
+// ============================================================================
+// 8) High-throughput OpenMP WACA-G2 v3.2 feature extractor for PyTorch training
+//    Shares exact C++ Stage 2.5 (8-dim) + Stage 3 extra (16-dim, fused 16-load
+//    + smooth ply 19..25 ramp Flood-Fill) formulas -> 0-bit skew!
+// ============================================================================
+void waca_g2_v32_extract_batch_features(const uint64_t* black,
+                                        const uint64_t* white,
+                                        const int8_t*   stm_in,
+                                        const uint8_t*  ply_in,
+                                        int32_t         n,
+                                        const int16_t*  tier1_w_flat, // [60 * 410022] PTM int16
+                                        uint64_t        aug_seed,
+                                        int32_t         enable_aug,
+                                        int32_t*        out_v1,       // [n]
+                                        int32_t*        out_f25,      // [n, 8]
+                                        int32_t*        out_f3_extra, // [n, 16] (optional)
+                                        int32_t*        out_key_ptm)  // [n, 14] (optional)
+{
+    const auto& pt = get_pattern_tables();
+    const size_t stride = static_cast<size_t>(pt.total_raw_entries);
+
+    #pragma omp parallel for schedule(static) if(n >= 1024)
+    for (int32_t i = 0; i < n; ++i) {
+        uint64_t P = (stm_in[i] > 0) ? black[i] : white[i];
+        uint64_t O = (stm_in[i] > 0) ? white[i] : black[i];
+        if (enable_aug != 0) {
+            const int d4 = static_cast<int>(
+                mix64(aug_seed ^ (static_cast<uint64_t>(i) * 0x9e3779b97f4a7c15ULL)) & 7ULL);
+            P = transform_bb_d4(P, d4);
+            O = transform_bb_d4(O, d4);
+        }
+
+        uint16_t idx[NUM_PATTERNS];
+        pt.extract_indices(P, O, idx); // P=2 (Player), E=1, O=0 (Opponent) -> exact PTM!
+
+        const int ply = static_cast<int>(ply_in[i]);
+        const int16_t* wp = tier1_w_flat + static_cast<size_t>(ply) * stride;
+
+        int32_t c[4], e[4];
+        int32_t c_sum = 0, e_sum = 0, l2d8_sum = 0, rest_sum = 0;
+        for (int p = 0; p < 4; ++p) {
+            const int32_t wv = wp[pt.meta[p].raw_off + idx[p]];
+            c[p] = wv;
+            c_sum += wv;
+        }
+        for (int p = 4; p < 8; ++p) {
+            const int32_t wv = wp[pt.meta[p].raw_off + idx[p]];
+            e[p - 4] = wv;
+            e_sum += wv;
+        }
+        for (int p = 8; p < NUM_KEY_PATTERNS; ++p) {
+            l2d8_sum += wp[pt.meta[p].raw_off + idx[p]];
+        }
+        for (int p = NUM_KEY_PATTERNS; p < 62; ++p) {
+            rest_sum += wp[pt.meta[p].raw_off + idx[p]];
+        }
+        const int32_t c2x4_sum = wp[pt.meta[62].raw_off + idx[62]] + wp[pt.meta[63].raw_off + idx[63]];
+        const int32_t inner16_sum = l2d8_sum + c2x4_sum;
+        const int32_t v1 = c_sum + e_sum + inner16_sum + rest_sum;
+
+        if (out_v1) out_v1[i] = v1;
+
+        int32_t f25[WACA_V32_F25];
+        uint64_t mvP = 0, mvO = 0;
+        extract_waca_v31_stage25_features(P, O, v1, ply, f25, mvP, mvO);
+        if (out_f25) {
+            int32_t* dst = out_f25 + static_cast<size_t>(i) * WACA_V32_F25;
+            for (int k = 0; k < WACA_V32_F25; ++k) dst[k] = f25[k];
+        }
+        if (out_f3_extra) {
+            int32_t fex[WACA_V32_F3_EXTRA];
+            extract_waca_v32_stage3_extra_features(P, O, mvP, mvO, ply, c, e,
+                                                   c_sum, e_sum, inner16_sum, fex);
+            int32_t* dst = out_f3_extra + static_cast<size_t>(i) * WACA_V32_F3_EXTRA;
+            for (int k = 0; k < WACA_V32_F3_EXTRA; ++k) dst[k] = fex[k];
+        }
+        if (out_key_ptm) {
+            int32_t* kp = out_key_ptm + static_cast<size_t>(i) * NUM_KEY_PATTERNS;
+            for (int p = 0; p < NUM_KEY_PATTERNS; ++p) {
+                kp[p] = pt.meta[p].raw_off + idx[p];
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 9) Evaluate all 3 stages (V1, V25, V3) of a .p2c v3.2 WACA_G2_V32 file + 16-sym check
+// ============================================================================
+int32_t waca_g2_v32_eval_file_batch_stages(const char*     p2c_path,
+                                           const uint64_t* black,
+                                           const uint64_t* white,
+                                           const int8_t*   stm,
+                                           const uint8_t*  ply,
+                                           int32_t         n,
+                                           int32_t*        out_v1,
+                                           int32_t*        out_v25,
+                                           int32_t*        out_v3,
+                                           int32_t*        out_max_sym_err3) { // [3] (optional)
+    LoadedModel model;
+    std::string err;
+    if (!load_p2c_model(p2c_path, model, &err) || !model.is_waca_v32) {
+        std::fprintf(stderr, "[p2c64_batch_bridge] load WACA_G2_V32 failed: %s\n", err.c_str());
+        return -1;
+    }
+    const auto& pt = get_pattern_tables();
+    int32_t me[3] = {0, 0, 0};
+
+    for (int32_t i = 0; i < n; ++i) {
+        uint16_t idx[NUM_PATTERNS];
+        pt.extract_indices(black[i], white[i], idx);
+        int32_t v1 = 0, v25 = 0, v3 = 0;
+        eval_waca_g2_v32_stages(*model.waca_v32, pt.meta, idx, black[i], white[i],
+                                static_cast<int>(stm[i]), static_cast<int>(ply[i]),
+                                v1, v25, v3);
+        if (out_v1)  out_v1[i]  = v1;
+        if (out_v25) out_v25[i] = v25;
+        if (out_v3)  out_v3[i]  = v3;
+
+        if (out_max_sym_err3) {
+            for (int sym = 0; sym < 16; ++sym) {
+                uint64_t tb = 0, tw = 0;
+                int tstm = 0;
+                transform_board_d4z2(black[i], white[i], static_cast<int>(stm[i]), sym, tb, tw, tstm);
+                uint16_t tidx[NUM_PATTERNS];
+                pt.extract_indices(tb, tw, tidx);
+                int32_t tv1 = 0, tv25 = 0, tv3 = 0;
+                eval_waca_g2_v32_stages(*model.waca_v32, pt.meta, tidx, tb, tw, tstm,
+                                        static_cast<int>(ply[i]), tv1, tv25, tv3);
+                const int32_t d1 = abs_i32(tv1 - v1);
+                const int32_t d2 = abs_i32(tv25 - v25);
+                const int32_t d3 = abs_i32(tv3 - v3);
+                if (d1 > me[0]) me[0] = d1;
+                if (d2 > me[1]) me[1] = d2;
+                if (d3 > me[2]) me[2] = d3;
+            }
+        }
+    }
+    if (out_max_sym_err3) {
+        out_max_sym_err3[0] = me[0];
+        out_max_sym_err3[1] = me[1];
+        out_max_sym_err3[2] = me[2];
+    }
+    return model.waca_v32->mlp_hidden;
+}
+
 uint64_t p2c64_fnv1a_64(const void* data, size_t len) {
     return fnv1a_64_update(fnv1a_64_init(), data, len);
 }

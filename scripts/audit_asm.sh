@@ -38,9 +38,14 @@ targets = [
     ("WACA_V31 Stage2.5",     r"<(?:int )?p2c64::eval_waca_v31_stage25_kernel\([^>]*>:\n(.*?)(?:\n\n|\Z)", 16, True),
     ("WACA_V31 Stage3 [B]",   r"<int p2c64::eval_waca_v31_stage3_ptm<false>\([^>]*>:\n(.*?)(?:\n\n|\Z)", 160, False),
     ("WACA_V31 Stage3 [W]",   r"<int p2c64::eval_waca_v31_stage3_ptm<true>\([^>]*>:\n(.*?)(?:\n\n|\Z)",  160, False),
+    ("WACA_V32 Stage1 [B]",   r"<int p2c64::eval_waca_v32_stage1_ptm<false>\([^>]*>:\n(.*?)(?:\n\n|\Z)", 0, False),
+    ("WACA_V32 Stage1 [W]",   r"<int p2c64::eval_waca_v32_stage1_ptm<true>\([^>]*>:\n(.*?)(?:\n\n|\Z)",  0, False),
+    ("WACA_V32 Stage2.5",     r"<(?:int )?p2c64::eval_waca_v32_stage25_kernel\([^>]*>:\n(.*?)(?:\n\n|\Z)", 16, True),
+    ("WACA_V32 Stage3 [B]",   r"<int p2c64::eval_waca_v32_stage3_ptm<false>\([^>]*>:\n(.*?)(?:\n\n|\Z)", 160, True),
+    ("WACA_V32 Stage3 [W]",   r"<int p2c64::eval_waca_v32_stage3_ptm<true>\([^>]*>:\n(.*?)(?:\n\n|\Z)",  160, True),
 ]
 
-print("=== P2C-64 v3.1 Pure-Scalar Assembly Audit (objdump -d -C, Black [B] & White [W]) ===")
+print("=== P2C-64 v3.2 Pure-Scalar Assembly Audit (objdump -d -C, Black [B] & White [W]) ===")
 print(f"{'Kernel':<22} | {'Insns':>6} | {'imul':>5} | {'div':>4} | {'calls':>5} | {'xmm/ymm/zmm':>11} | Status")
 print("-" * 82)
 
@@ -69,8 +74,11 @@ for item in targets:
     if avx > 0 or simd > 0:
         status = f"FAIL (expected 0 simd, got {simd})"
         failed = True
-    elif forbid_calls and (pop_plt > 0 or calls > 0):
-        status = f"FAIL (expected 0 calls/popcnt_plt, got calls={calls} pop_plt={pop_plt})"
+    elif pop_plt > 0:
+        status = f"FAIL (expected 0 __popcountdi2@plt, got {pop_plt})"
+        failed = True
+    elif forbid_calls and calls > 0:
+        status = f"FAIL (expected 0 calls, got calls={calls})"
         failed = True
     elif imuls > max_imul:
         status = f"FAIL (expected <={max_imul} imul, got {imuls})"
@@ -80,5 +88,5 @@ for item in targets:
 
 if failed:
     sys.exit(1)
-print(f"\n[PASS] Assembly audit verified: 0 SIMD/AVX across all {len(targets)} v2.0 + v3.0 + v3.1 kernels (0 PLT calls in Stage 2.5)!")
+print(f"\n[PASS] Assembly audit verified: 0 SIMD/AVX across all {len(targets)} v2.0 + v3.0 + v3.1 + v3.2 kernels (0 PLT/popcnt calls in Stage 2.5 & Stage 3)!")
 PYEOF

@@ -81,6 +81,36 @@ static constexpr int8_t STATIC_MOVE_ORDER[64] = {
     120, -25,  20,  10,  10,  20, -25, 120
 };
 
+static constexpr int8_t ADJ_CORNER_SQ[64] = {
+    -1,  0, -1, -1, -1, -1,  7, -1,
+     0,  0, -1, -1, -1, -1,  7,  7,
+    -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1,
+    56, 56, -1, -1, -1, -1, 63, 63,
+    -1, 56, -1, -1, -1, -1, 63, -1
+};
+
+static inline int context_sq_score(int sq, uint64_t occ) noexcept {
+    int s = static_cast<int>(STATIC_MOVE_ORDER[sq]);
+    const int corner = static_cast<int>(ADJ_CORNER_SQ[sq]);
+    if (corner >= 0 && ((occ >> corner) & 1ULL)) {
+        // Adjacent corner already occupied: remove C/X penalty and reward safe corner-adjacent play
+        s = (s <= -40) ? 18 : 28;
+    }
+    return s;
+}
+
+enum class MoveOrderMode : int {
+    STATIC    = 0,
+    B4_HYBRID = 1
+};
+
+static inline const char* move_order_mode_name(MoveOrderMode mo) noexcept {
+    return (mo == MoveOrderMode::B4_HYBRID) ? "b4_hybrid" : "static";
+}
+
 enum class SearchLimitMode : int {
     DEPTH = 0,
     NODES = 1,
@@ -113,14 +143,19 @@ public:
     uint8_t  tt_gen_          = 1;
     int      endgame_empties_ = 10;
 
-    // Standard Multi-ProbCut & WACA-G2 2-stage gating parameters (100% fair across models!)
-    bool     use_mpc_         = false;
-    double   mpc_t_           = 1.80;
-    bool     mpc_pure_v64_    = false; // Default OFF: fair gated WACA_G2 + TT write on MPC probes!
-    GateMode gate_mode_       = GateMode::SAFE_BND;
-    int32_t  m25_units_       = 320; // 2.5 discs * 128
-    int32_t  m3_units_        = 192; // 1.5 discs * 128
-    int32_t  tt_guard_units_  = 576; // 4.5 discs * 128 (used by GateMode::WIDE_SAFE_BND)
+    // Standard Multi-ProbCut, Move Ordering & WACA-G2 2-stage gating parameters (100% fair across models!)
+    bool          use_mpc_        = false;
+    double        mpc_t_          = 1.80;
+    bool          mpc_pure_v64_   = false; // Default OFF: fair gated WACA_G2 + TT write on MPC probes!
+    MoveOrderMode mo_mode_        = MoveOrderMode::STATIC;
+    GateMode      gate_mode_      = GateMode::SAFE_BND;
+    int32_t       m25_units_      = 320; // 2.5 discs * 128
+    int32_t       m3_units_       = 192; // 1.5 discs * 128
+    int32_t       tt_guard_units_ = 576; // 4.5 discs * 128 (used by GateMode::WIDE_SAFE_BND)
+
+    // B4_HYBRID Killer (2 slots per ply) & History (2 sides x 64 sq) tables
+    uint8_t  killer_[64][2]{};
+    int32_t  history_[2][64]{};
 
     // Runtime limits & counters
     uint64_t nodes_           = 0;
@@ -140,6 +175,7 @@ public:
     explicit PVSEngine(const LoadedModel* model, size_t tt_mb = 64, int endgame_empties = 10)
         : model_(model), pt_(get_pattern_tables()), zk_(get_zobrist()), endgame_empties_(endgame_empties) {
         allocate_tt(tt_mb);
+        clear_heuristics();
     }
 
     void set_mpc(bool enable, double t_val = 1.80) noexcept {
@@ -149,6 +185,10 @@ public:
 
     void set_mpc_pure_v64(bool enable) noexcept {
         mpc_pure_v64_ = enable;
+    }
+
+    void set_move_order_mode(MoveOrderMode mo) noexcept {
+        mo_mode_ = mo;
     }
 
     void set_waca_gate(GateMode gm, double m25_discs, double m3_discs, double tt_guard_discs = 4.5) noexcept {
@@ -174,9 +214,27 @@ public:
         tt_mask_ = entries - 1;
     }
 
+    void clear_killers() noexcept {
+        std::memset(killer_, 64, sizeof(killer_));
+    }
+
+    void clear_heuristics() noexcept {
+        clear_killers();
+        std::memset(history_, 0, sizeof(history_));
+    }
+
+    void decay_history() noexcept {
+        for (int s = 0; s < 2; ++s) {
+            for (int sq = 0; sq < 64; ++sq) {
+                history_[s][sq] >>= 1;
+            }
+        }
+    }
+
     void clear_tt() {
         std::memset(tt_.data(), 0, tt_.size() * sizeof(SearchTTEntry));
         tt_gen_ = 1;
+        clear_heuristics();
     }
 
     inline int32_t scale_exact(int exact_disc) const noexcept {
@@ -408,14 +466,69 @@ public:
 
         int moves[32];
         int scores[32];
+        uint64_t cached_flips[32];
         int n_moves = 0;
+        const int side = (stm > 0) ? 0 : 1;
+        const int kply = std::clamp(ply, 0, 63);
+        const bool use_b4 = (mo_mode_ == MoveOrderMode::B4_HYBRID && depth >= 2);
+        const bool use_ff = (use_b4 && depth >= 4);
+
         uint64_t m = mv;
-        while (m) {
-            int sq = __builtin_ctzll(m);
-            m &= m - 1;
-            moves[n_moves]  = sq;
-            scores[n_moves] = (sq == tt_move) ? 10000 : static_cast<int>(STATIC_MOVE_ORDER[sq]);
-            n_moves++;
+        if (!use_b4) {
+            while (m) {
+                int sq = __builtin_ctzll(m);
+                m &= m - 1;
+                moves[n_moves]        = sq;
+                scores[n_moves]       = (sq == tt_move) ? 1000000 : static_cast<int>(STATIC_MOVE_ORDER[sq]);
+                cached_flips[n_moves] = 0ULL;
+                n_moves++;
+            }
+        } else {
+            const uint64_t occ = B | W;
+            const uint8_t k0   = killer_[kply][0];
+            const uint8_t k1   = killer_[kply][1];
+            if (use_ff) {
+                while (m) {
+                    int sq = __builtin_ctzll(m);
+                    m &= m - 1;
+                    moves[n_moves] = sq;
+                    if (sq == tt_move) {
+                        scores[n_moves]       = 1000000;
+                        cached_flips[n_moves] = 0ULL;
+                    } else {
+                        const uint64_t fl = calc_flips(sq, P, O);
+                        cached_flips[n_moves] = fl;
+                        const uint64_t nP = P | (1ULL << sq) | fl;
+                        const uint64_t nO = O ^ fl;
+                        const int opp_mob = popcount64_swar(generate_moves(nO, nP));
+                        int sc = -opp_mob * 128 + context_sq_score(sq, occ) * 4;
+                        if (opp_mob == 0) sc += 400;
+                        if (sq == k0)      sc += 320;
+                        else if (sq == k1) sc += 200;
+                        sc += (history_[side][sq] >> 4);
+                        scores[n_moves] = sc;
+                    }
+                    n_moves++;
+                }
+            } else {
+                // depth == 2..3: zero calc_flips corner-occupancy context + 2-slot Killer + History
+                while (m) {
+                    int sq = __builtin_ctzll(m);
+                    m &= m - 1;
+                    moves[n_moves]        = sq;
+                    cached_flips[n_moves] = 0ULL;
+                    if (sq == tt_move) {
+                        scores[n_moves] = 1000000;
+                    } else {
+                        int sc = context_sq_score(sq, occ) * 8;
+                        if (sq == k0)      sc += 600;
+                        else if (sq == k1) sc += 350;
+                        sc += (history_[side][sq] >> 3);
+                        scores[n_moves] = sc;
+                    }
+                    n_moves++;
+                }
+            }
         }
 
         int32_t best_val = -SEARCH_INF;
@@ -431,10 +544,11 @@ public:
             if (best_idx != i) {
                 std::swap(moves[i], moves[best_idx]);
                 std::swap(scores[i], scores[best_idx]);
+                std::swap(cached_flips[i], cached_flips[best_idx]);
             }
 
             const int sq = moves[i];
-            const uint64_t fl = calc_flips(sq, P, O);
+            const uint64_t fl = cached_flips[i] ? cached_flips[i] : calc_flips(sq, P, O);
             uint64_t nB = B, nW = W;
             uint64_t nh = hash ^ zk_.stm_key;
             if (stm > 0) {
@@ -485,7 +599,20 @@ public:
             }
             if (val > alpha) {
                 alpha = val;
-                if (alpha >= beta) break;
+                if (alpha >= beta) {
+                    if (use_b4) {
+                        const uint8_t usq = static_cast<uint8_t>(sq);
+                        if (killer_[kply][0] != usq) {
+                            killer_[kply][1] = killer_[kply][0];
+                            killer_[kply][0] = usq;
+                        }
+                        history_[side][sq] += depth * depth;
+                        if (history_[side][sq] > 65536) {
+                            for (int hsq = 0; hsq < 64; ++hsq) history_[side][hsq] >>= 1;
+                        }
+                    }
+                    break;
+                }
             }
         }
 
@@ -530,6 +657,10 @@ public:
 
         tt_gen_ = static_cast<uint8_t>((tt_gen_ + 1) & 0xFFU);
         if (tt_gen_ == 0) tt_gen_ = 1;
+        if (mo_mode_ == MoveOrderMode::B4_HYBRID) {
+            clear_killers();
+            decay_history();
+        }
 
         nodes_            = 0;
         aborted_          = false;
