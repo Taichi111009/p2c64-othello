@@ -483,6 +483,95 @@ int main() {
                 (s25_v32_ns * 0.15 + s3_v32_h16_cold * 0.05) - (s25_v31_ns * 0.15 + s3_v31_h16_ns * 0.05),
                 static_cast<unsigned long long>(sink_32 & 0xFF));
 
+    // WACA-G2 v3.3 (12-dim Poly Stage 2.5 + Key14 8ch + Center10 4ch + 44-term Pairwise SCReLU + H=16 j-Tile Stage 3)
+    WacaG2V33Weights wg33;
+    wg33.mlp_hidden = 16;
+    wg33.tier1 = raw;
+    for (int ply = 0; ply < NUM_PLIES; ++ply) {
+        wg33.s25[ply].b = 128;
+        for (int i = 0; i < WACA_V33_F25; ++i) wg33.s25[ply].w[i] = static_cast<int16_t>(((ply + i) & 1) ? 45 : -35);
+        for (int g = 0; g < 3; ++g) {
+            for (int k = 0; k < 8; ++k) wg33.screlu[ply].mu_key[g][k] = 16;
+        }
+        for (int k = 0; k < 4; ++k) wg33.screlu[ply].mu_ctr[k] = 16;
+        for (int m = 0; m < WACA_V33_SCRELU_TERMS; ++m) {
+            wg33.screlu[ply].beta[m] = static_cast<int16_t>((m & 1) ? -48 : 64);
+        }
+        wg33.mlp[ply].b2 = 64;
+        for (int j = 0; j < WACA_V33_MAX_HID; ++j) {
+            wg33.mlp[ply].b1[j] = 4096;
+            wg33.mlp[ply].w2[j] = static_cast<int16_t>((j & 1) ? 24 : -18);
+            for (int i = 0; i < WACA_V33_F3; ++i) wg33.mlp[ply].w1[j][i] = static_cast<int8_t>(((j * 7 + i * 3) % 31) - 15);
+        }
+    }
+    for (int b = 0; b < WACA_V33_EO_BLOCKS; ++b) {
+        for (auto& e : wg33.h_emb[b]) {
+            for (int k = 0; k < 8; ++k) e.h[k] = static_cast<int8_t>((rng.next() & 127U) - 64);
+        }
+        for (auto& c : wg33.ctr_emb[b]) {
+            for (int k = 0; k < 4; ++k) c.h[k] = static_cast<int8_t>((rng.next() & 127U) - 64);
+        }
+    }
+
+    bench_one("10. WACA_G2_V33 Stage1 (T1)", leaves, tt,
+        [&](const uint16_t* idx, int stm, int ply) {
+            return (stm < 0) ? eval_waca_v33_stage1_ptm<true>(wg33.tier1, pt.meta, idx, ply)
+                             : eval_waca_v33_stage1_ptm<false>(wg33.tier1, pt.meta, idx, ply);
+        },
+        ref_eval, ref_tt);
+
+    volatile int64_t sink_33 = 0;
+    alignas(64) int32_t fbuf_v33[WACA_V33_F3]{};
+    uint64_t mvP_33 = 0, mvO_33 = 0;
+
+    auto t33_s25 = std::chrono::steady_clock::now();
+    for (int pass = 0; pass < 6; ++pass) {
+        for (size_t i = 0; i < leaves.size(); ++i) {
+            const auto& lf = leaves[i];
+            sink_33 += eval_waca_v33_stage25_kernel(wg33, lf.P, lf.O,
+                                                    128, lf.ply, fbuf_v33, mvP_33, mvO_33);
+        }
+    }
+    const double s25_v33_ns = std::chrono::duration<double>(std::chrono::steady_clock::now() - t33_s25).count()
+                            * 1e9 / (6.0 * static_cast<double>(leaves.size()));
+
+    auto bench_v33_s3 = [&](bool warm_s1) -> double {
+        wg33.mlp_hidden = 16;
+        auto t0 = std::chrono::steady_clock::now();
+        for (int pass = 0; pass < 6; ++pass) {
+            for (size_t i = 0; i < leaves.size(); ++i) {
+                const auto& lf = leaves[i];
+                int32_t v1 = 128;
+                if (warm_s1) {
+                    v1 = (lf.stm < 0) ? eval_waca_v33_stage1_ptm<true>(wg33.tier1, pt.meta, lf.idx, lf.ply)
+                                      : eval_waca_v33_stage1_ptm<false>(wg33.tier1, pt.meta, lf.idx, lf.ply);
+                }
+                sink_33 += v1 + ((lf.stm < 0)
+                         ? eval_waca_v33_stage3_ptm<true>(wg33, pt.meta, lf.idx, lf.P, lf.O,
+                                                          mvP_33, mvO_33, v1, fbuf_v33, 16, lf.ply)
+                         : eval_waca_v33_stage3_ptm<false>(wg33, pt.meta, lf.idx, lf.P, lf.O,
+                                                           mvP_33, mvO_33, v1, fbuf_v33, 16, lf.ply));
+            }
+        }
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
+             * 1e9 / (6.0 * static_cast<double>(leaves.size()));
+    };
+    const double s3_v33_h16_cold = bench_v33_s3(false);
+    const double s3_v33_h16_hot  = bench_v33_s3(true) - ref_eval;
+
+    std::printf("\n=== WACA-G2 v3.3 Standalone & L1D-Hot Stage Microbenchmark (Real DFS Boards, Zero SIMD) ===\n");
+    std::printf("  Stage 2.5 v3.3 (12-dim poly, 3 SWAR popcnt): %6.1f ns/call  (vs v3.2 %+5.1f ns | @15%% = %4.1f ns/leaf)\n",
+                s25_v33_ns, s25_v33_ns - s25_v32_ns, s25_v33_ns * 0.15);
+    std::printf("  Stage 3   v3.3 (H=16, Key14-8ch+Ctr10, cold): %6.1f ns/call  (vs v3.1 %+5.1f ns | vs v3.2 %+5.1f ns | @5%% = %4.1f ns/leaf)\n",
+                s3_v33_h16_cold, s3_v33_h16_cold - s3_v31_h16_ns, s3_v33_h16_cold - s3_v32_h16_cold, s3_v33_h16_cold * 0.05);
+    std::printf("  Stage 3   v3.3 (H=16, L1D-hot after S1)    : %6.1f ns/call  (vs v3.1 hot %+5.1f ns | vs v3.2 hot %+5.1f ns)\n",
+                s3_v33_h16_hot, s3_v33_h16_hot - s3_v31_h16_hot, s3_v33_h16_hot - s3_v32_h16_hot);
+    std::printf("  Amortized v3.3 (H=16, 15%% S2.5 + 5%% S3)   : %5.1f ns/leaf (vs v3.1 %+5.1f ns | vs v3.2 %+5.1f ns, chk:%02llx)\n",
+                s25_v33_ns * 0.15 + s3_v33_h16_cold * 0.05,
+                (s25_v33_ns * 0.15 + s3_v33_h16_cold * 0.05) - (s25_v31_ns * 0.15 + s3_v31_h16_ns * 0.05),
+                (s25_v33_ns * 0.15 + s3_v33_h16_cold * 0.05) - (s25_v32_ns * 0.15 + s3_v32_h16_cold * 0.05),
+                static_cast<unsigned long long>(sink_33 & 0xFF));
+
     std::free(tt);
     return 0;
 }

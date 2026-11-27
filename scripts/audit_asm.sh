@@ -43,9 +43,14 @@ targets = [
     ("WACA_V32 Stage2.5",     r"<(?:int )?p2c64::eval_waca_v32_stage25_kernel\([^>]*>:\n(.*?)(?:\n\n|\Z)", 16, True),
     ("WACA_V32 Stage3 [B]",   r"<int p2c64::eval_waca_v32_stage3_ptm<false>\([^>]*>:\n(.*?)(?:\n\n|\Z)", 160, True),
     ("WACA_V32 Stage3 [W]",   r"<int p2c64::eval_waca_v32_stage3_ptm<true>\([^>]*>:\n(.*?)(?:\n\n|\Z)",  160, True),
+    ("WACA_V33 Stage1 [B]",   r"<int p2c64::eval_waca_v33_stage1_ptm<false>\([^>]*>:\n(.*?)(?:\n\n|\Z)", 0, False),
+    ("WACA_V33 Stage1 [W]",   r"<int p2c64::eval_waca_v33_stage1_ptm<true>\([^>]*>:\n(.*?)(?:\n\n|\Z)",  0, False),
+    ("WACA_V33 Stage2.5",     r"<(?:int )?p2c64::eval_waca_v33_stage25_kernel\([^>]*>:\n(.*?)(?:\n\n|\Z)", 20, True),
+    ("WACA_V33 Stage3 [B]",   r"<int p2c64::eval_waca_v33_stage3_ptm<false>\([^>]*>:\n(.*?)(?:\n\n|\Z)", 220, True),
+    ("WACA_V33 Stage3 [W]",   r"<int p2c64::eval_waca_v33_stage3_ptm<true>\([^>]*>:\n(.*?)(?:\n\n|\Z)",  220, True),
 ]
 
-print("=== P2C-64 v3.2 Pure-Scalar Assembly Audit (objdump -d -C, Black [B] & White [W]) ===")
+print("=== P2C-64 v3.3 Pure-Scalar Assembly Audit (objdump -d -C, Black [B] & White [W]) ===")
 print(f"{'Kernel':<22} | {'Insns':>6} | {'imul':>5} | {'div':>4} | {'calls':>5} | {'xmm/ymm/zmm':>11} | Status")
 print("-" * 82)
 
@@ -88,5 +93,5 @@ for item in targets:
 
 if failed:
     sys.exit(1)
-print(f"\n[PASS] Assembly audit verified: 0 SIMD/AVX across all {len(targets)} v2.0 + v3.0 + v3.1 + v3.2 kernels (0 PLT/popcnt calls in Stage 2.5 & Stage 3)!")
+print(f"\n[PASS] Assembly audit verified: 0 SIMD/AVX across all {len(targets)} v2.0 + v3.0 + v3.1 + v3.2 + v3.3 kernels (0 PLT/popcnt calls in Stage 2.5 & Stage 3)!")
 PYEOF

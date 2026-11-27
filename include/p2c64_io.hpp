@@ -13,12 +13,13 @@
 namespace p2c64 {
 
 // ============================================================================
-// P2C-64 Binary Weight File Format (.p2c: v2.0 / v3.0 / v3.1 / v3.2 backward-compatible)
+// P2C-64 Binary Weight File Format (.p2c: v2.0 / v3.0 / v3.1 / v3.2 / v3.3 backward-compatible)
 //   - Fixed 64-byte little-endian header + FNV-1a 64-bit checksum
 //   - v2.0 (magic="P2C64V20", version=2) : RAW_NTUPLE_64 (46.92 MiB) & v2.0 models (50.61 MiB)
 //   - v3.0 (magic="P2C64V30", version=3) : WACA_G2     (53.96 MiB, 20-blk EO, F25=16, F3=24)
 //   - v3.1 (magic="P2C64V31", version=4) : WACA_G2_V31 (57.48 MiB, 30-blk EO, F25=8,  F3=32)
 //   - v3.2 (magic="P2C64V32", version=5) : WACA_G2_V32 (57.47 MiB, 30-blk EO, F25=8,  F3=28)
+//   - v3.3 (magic="P2C64V33", version=6) : WACA_G2_V33 (70.24 MiB, 30-blk EO Key14-8ch + Ctr10-4ch, F25=12, F3=32)
 // ============================================================================
 static constexpr char     P2C_MAGIC[8]           = {'P','2','C','6','4','V','2','0'};
 static constexpr uint32_t P2C_FORMAT_VERSION     = 2U;
@@ -28,21 +29,23 @@ static constexpr char     P2C_MAGIC_V31[8]       = {'P','2','C','6','4','V','3',
 static constexpr uint32_t P2C_FORMAT_VERSION_V31 = 4U;
 static constexpr char     P2C_MAGIC_V32[8]       = {'P','2','C','6','4','V','3','2'};
 static constexpr uint32_t P2C_FORMAT_VERSION_V32 = 5U;
+static constexpr char     P2C_MAGIC_V33[8]       = {'P','2','C','6','4','V','3','3'};
+static constexpr uint32_t P2C_FORMAT_VERSION_V33 = 6U;
 static constexpr float    P2C_DEFAULT_SCALE      = 128.0f;
 
 #pragma pack(push, 1)
 struct P2CFileHeader {
     char     magic[8];
-    uint32_t version;            // 2 (v2.0), 3 (v3.0), 4 (v3.1), or 5 (v3.2 WACA_G2_V32)
-    uint32_t eval_mode;          // EvalMode enum value [0..8]
+    uint32_t version;            // 2 (v2.0), 3 (v3.0), 4 (v3.1), 5 (v3.2), or 6 (v3.3 WACA_G2_V33)
+    uint32_t eval_mode;          // EvalMode enum value [0..9]
     float    score_scale;        // Integer eval units per 1.0 disc
     uint32_t flags;              // Bit 0 = D4 symmetrized
     uint32_t key_raw_entries;    // 91,854
     uint32_t nonkey_raw_entries; // 318,168
     uint32_t total_raw_entries;  // 410,022
     uint32_t num_plies;          // 60
-    uint32_t num_blocks;         // 10 (v2.0), 20 (v3.0 EO), or 30 (v3.1/v3.2 EO)
-    uint32_t reserved;           // 0 (v2.0) or mlp_hidden (v3.0/v3.1/v3.2: 16 or 24)
+    uint32_t num_blocks;         // 10 (v2.0), 20 (v3.0 EO), or 30 (v3.1/v3.2/v3.3 EO)
+    uint32_t reserved;           // 0 (v2.0) or mlp_hidden (v3.0/v3.1/v3.2/v3.3: 16 or 24)
     uint64_t payload_bytes;      // Exact payload length in bytes
     uint64_t checksum_fnv1a;     // 64-bit FNV-1a checksum of payload bytes
 };
@@ -73,6 +76,7 @@ static inline const char* eval_mode_name(EvalMode mode) noexcept {
         case EvalMode::WACA_G2:               return "WACA_G2";
         case EvalMode::WACA_G2_V31:           return "WACA_G2_V31";
         case EvalMode::WACA_G2_V32:           return "WACA_G2_V32";
+        case EvalMode::WACA_G2_V33:           return "WACA_G2_V33";
     }
     return "UNKNOWN";
 }
@@ -86,12 +90,14 @@ struct LoadedModel {
     WacaG2Weights                     waca;
     std::unique_ptr<WacaG2V31Weights> waca_v31;
     std::unique_ptr<WacaG2V32Weights> waca_v32;
+    std::unique_ptr<WacaG2V33Weights> waca_v33;
     bool                              is_raw      = false;
     bool                              is_waca     = false;
     bool                              is_waca_v31 = false;
     bool                              is_waca_v32 = false;
+    bool                              is_waca_v33 = false;
 
-    inline bool is_any_waca() const noexcept { return is_waca || is_waca_v31 || is_waca_v32; }
+    inline bool is_any_waca() const noexcept { return is_waca || is_waca_v31 || is_waca_v32 || is_waca_v33; }
 
     inline int32_t evaluate(const PatternMeta* __restrict meta,
                             const uint16_t* __restrict idx,
@@ -115,6 +121,8 @@ struct LoadedModel {
                 return eval_raw_ntuple64(waca_v31->tier1, meta, idx, stm, ply);
             case EvalMode::WACA_G2_V32:
                 return eval_raw_ntuple64(waca_v32->tier1, meta, idx, stm, ply);
+            case EvalMode::WACA_G2_V33:
+                return eval_raw_ntuple64(waca_v33->tier1, meta, idx, stm, ply);
         }
         return 0;
     }
@@ -123,6 +131,9 @@ struct LoadedModel {
                                   const uint16_t* __restrict idx,
                                   uint64_t B, uint64_t W,
                                   int stm, int ply) const noexcept {
+        if (is_waca_v33) {
+            return eval_waca_g2_v33_full(*waca_v33, meta, idx, B, W, stm, ply);
+        }
         if (is_waca_v32) {
             return eval_waca_g2_v32_full(*waca_v32, meta, idx, B, W, stm, ply);
         }
@@ -138,6 +149,9 @@ struct LoadedModel {
     inline int32_t evaluate_tier1_only(const PatternMeta* __restrict meta,
                                        const uint16_t* __restrict idx,
                                        int stm, int ply) const noexcept {
+        if (is_waca_v33) {
+            return eval_raw_ntuple64(waca_v33->tier1, meta, idx, stm, ply);
+        }
         if (is_waca_v32) {
             return eval_raw_ntuple64(waca_v32->tier1, meta, idx, stm, ply);
         }
@@ -162,6 +176,11 @@ struct LoadedModel {
                                    uint64_t& stat_s25,
                                    uint64_t& stat_s3,
                                    int32_t tt_guard_units = 576) const noexcept {
+        if (is_waca_v33) {
+            return eval_waca_g2_v33_gated(*waca_v33, meta, idx, B, W, stm, ply, alpha, beta,
+                                          in_mpc_probe, gate_mode, m25_units, m3_units,
+                                          stat_s25, stat_s3, tt_guard_units);
+        }
         if (is_waca_v32) {
             return eval_waca_g2_v32_gated(*waca_v32, meta, idx, B, W, stm, ply, alpha, beta,
                                           in_mpc_probe, gate_mode, m25_units, m3_units,
@@ -446,6 +465,69 @@ inline bool save_waca_g2_v32_p2c(const std::string& path,
     return static_cast<bool>(ofs);
 }
 
+inline bool save_waca_g2_v33_p2c(const std::string& path,
+                                 const WacaG2V33Weights& w,
+                                 float score_scale = P2C_DEFAULT_SCALE,
+                                 uint32_t flags = 1U) {
+    const auto& pt = get_pattern_tables();
+    const int H = std::clamp<int>(w.mlp_hidden, 1, WACA_V33_MAX_HID);
+    const size_t t1_bytes  = static_cast<size_t>(pt.total_raw_entries) * sizeof(int16_t);
+    const size_t emb_bytes = static_cast<size_t>(pt.key_raw_entries) * sizeof(WacaKeyEmb8);
+    const size_t ctr_bytes = static_cast<size_t>(WACA_V33_CTR_RAW_ENTRIES) * sizeof(WacaKeyEmb4);
+
+    std::vector<uint8_t> payload;
+    payload.reserve(NUM_PLIES * t1_bytes + WACA_V33_EO_BLOCKS * (emb_bytes + ctr_bytes) + 131072);
+
+    auto append = [&](const void* src, size_t n) {
+        const uint8_t* p = static_cast<const uint8_t*>(src);
+        payload.insert(payload.end(), p, p + n);
+    };
+
+    // 1) Tier-1 untouched 64-pattern x 60-ply PTM weights (46.92 MiB)
+    for (int ply = 0; ply < NUM_PLIES; ++ply) append(w.tier1.w_ply[ply].data(), t1_bytes);
+    // 2) Stage 2.5 12-dim polynomial linear weights & bias
+    for (int ply = 0; ply < NUM_PLIES; ++ply) append(w.s25[ply].w, WACA_V33_F25 * sizeof(int16_t));
+    for (int ply = 0; ply < NUM_PLIES; ++ply) append(&w.s25[ply].b, sizeof(int32_t));
+    // 3) Stage 3 physically separated 30-block EO Key-14 8ch embeddings (21.02 MiB)
+    for (int b = 0; b < WACA_V33_EO_BLOCKS; ++b) append(w.h_emb[b].data(), emb_bytes);
+    // 4) Stage 3 physically separated 30-block EO Center-10 4ch embeddings (2.25 MiB)
+    for (int b = 0; b < WACA_V33_EO_BLOCKS; ++b) append(w.ctr_emb[b].data(), ctr_bytes);
+    // 5) Stage 3 60-ply 44-term SCReLU/Pairwise/Center-Outer head (144B/ply)
+    for (int ply = 0; ply < NUM_PLIES; ++ply) {
+        append(w.screlu[ply].mu_key, 24 * sizeof(int16_t));
+        append(w.screlu[ply].mu_ctr,  4 * sizeof(int16_t));
+        append(w.screlu[ply].beta,   WACA_V33_SCRELU_TERMS * sizeof(int16_t));
+    }
+    // 6) Stage 3 60-ply 32->H->1 integer SCReLU MLP
+    for (int ply = 0; ply < NUM_PLIES; ++ply) {
+        for (int j = 0; j < H; ++j) append(w.mlp[ply].w1[j], WACA_V33_F3 * sizeof(int8_t));
+    }
+    for (int ply = 0; ply < NUM_PLIES; ++ply) append(w.mlp[ply].b1, static_cast<size_t>(H) * sizeof(int32_t));
+    for (int ply = 0; ply < NUM_PLIES; ++ply) append(w.mlp[ply].w2, static_cast<size_t>(H) * sizeof(int16_t));
+    for (int ply = 0; ply < NUM_PLIES; ++ply) append(&w.mlp[ply].b2, sizeof(int32_t));
+
+    P2CFileHeader hdr{};
+    std::memcpy(hdr.magic, P2C_MAGIC_V33, 8);
+    hdr.version            = P2C_FORMAT_VERSION_V33;
+    hdr.eval_mode          = static_cast<uint32_t>(EvalMode::WACA_G2_V33);
+    hdr.score_scale        = score_scale;
+    hdr.flags              = flags;
+    hdr.key_raw_entries    = static_cast<uint32_t>(pt.key_raw_entries);
+    hdr.nonkey_raw_entries = static_cast<uint32_t>(pt.nonkey_raw_entries);
+    hdr.total_raw_entries  = static_cast<uint32_t>(pt.total_raw_entries);
+    hdr.num_plies          = static_cast<uint32_t>(NUM_PLIES);
+    hdr.num_blocks         = static_cast<uint32_t>(WACA_V33_EO_BLOCKS);
+    hdr.reserved           = static_cast<uint32_t>(H);
+    hdr.payload_bytes      = static_cast<uint64_t>(payload.size());
+    hdr.checksum_fnv1a     = fnv1a_64_update(fnv1a_64_init(), payload.data(), payload.size());
+
+    std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
+    if (!ofs) return false;
+    ofs.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+    ofs.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+    return static_cast<bool>(ofs);
+}
+
 inline bool load_p2c_model(const std::string& path, LoadedModel& out, std::string* err_msg = nullptr) {
     auto fail = [&](const std::string& msg) -> bool {
         if (err_msg) *err_msg = msg;
@@ -463,8 +545,9 @@ inline bool load_p2c_model(const std::string& path, LoadedModel& out, std::strin
     const bool is_v3  = (std::memcmp(hdr.magic, P2C_MAGIC_V3, 8) == 0 && hdr.version == P2C_FORMAT_VERSION_V3);
     const bool is_v31 = (std::memcmp(hdr.magic, P2C_MAGIC_V31, 8) == 0 && hdr.version == P2C_FORMAT_VERSION_V31);
     const bool is_v32 = (std::memcmp(hdr.magic, P2C_MAGIC_V32, 8) == 0 && hdr.version == P2C_FORMAT_VERSION_V32);
-    if (!is_v2 && !is_v3 && !is_v31 && !is_v32) {
-        return fail("Invalid magic/version (expected P2C64V20 v2, P2C64V30 v3, P2C64V31 v4, or P2C64V32 v5) in: " + path);
+    const bool is_v33 = (std::memcmp(hdr.magic, P2C_MAGIC_V33, 8) == 0 && hdr.version == P2C_FORMAT_VERSION_V33);
+    if (!is_v2 && !is_v3 && !is_v31 && !is_v32 && !is_v33) {
+        return fail("Invalid magic/version (expected P2C64V20 v2, P2C64V30 v3, P2C64V31 v4, P2C64V32 v5, or P2C64V33 v6) in: " + path);
     }
 
     const auto& pt = get_pattern_tables();
@@ -502,7 +585,7 @@ inline bool load_p2c_model(const std::string& path, LoadedModel& out, std::strin
         if (hdr.reserved < 1U || hdr.reserved > static_cast<uint32_t>(WACA_V31_MAX_HID)) {
             return fail("Invalid v3.1 mlp_hidden in header (expected 1..24)");
         }
-    } else {
+    } else if (is_v32) {
         if (hdr.eval_mode != static_cast<uint32_t>(EvalMode::WACA_G2_V32)) {
             return fail("Invalid v3.2 eval_mode in header (expected WACA_G2_V32=8)");
         }
@@ -511,6 +594,16 @@ inline bool load_p2c_model(const std::string& path, LoadedModel& out, std::strin
         }
         if (hdr.reserved < 1U || hdr.reserved > static_cast<uint32_t>(WACA_V32_MAX_HID)) {
             return fail("Invalid v3.2 mlp_hidden in header (expected 1..24)");
+        }
+    } else {
+        if (hdr.eval_mode != static_cast<uint32_t>(EvalMode::WACA_G2_V33)) {
+            return fail("Invalid v3.3 eval_mode in header (expected WACA_G2_V33=9)");
+        }
+        if (hdr.num_blocks != static_cast<uint32_t>(WACA_V33_EO_BLOCKS)) {
+            return fail("Header num_blocks mismatch P2C-64 v3.3 spec (expected 30 EO blocks)");
+        }
+        if (hdr.reserved < 1U || hdr.reserved > static_cast<uint32_t>(WACA_V33_MAX_HID)) {
+            return fail("Invalid v3.3 mlp_hidden in header (expected 1..24)");
         }
     }
 
@@ -530,6 +623,7 @@ inline bool load_p2c_model(const std::string& path, LoadedModel& out, std::strin
     out.is_waca     = (out.mode == EvalMode::WACA_G2);
     out.is_waca_v31 = (out.mode == EvalMode::WACA_G2_V31);
     out.is_waca_v32 = (out.mode == EvalMode::WACA_G2_V32);
+    out.is_waca_v33 = (out.mode == EvalMode::WACA_G2_V33);
 
     size_t off = 0;
     auto read_chunk = [&](void* dst, size_t n) -> bool {
@@ -543,6 +637,49 @@ inline bool load_p2c_model(const std::string& path, LoadedModel& out, std::strin
         const size_t w_bytes = static_cast<size_t>(pt.total_raw_entries) * sizeof(int16_t);
         for (int ply = 0; ply < NUM_PLIES; ++ply) {
             if (!read_chunk(out.raw.w_ply[ply].data(), w_bytes)) return fail("RAW w_ply read error");
+        }
+    } else if (out.is_waca_v33) {
+        out.waca_v33 = std::make_unique<WacaG2V33Weights>();
+        auto& wv = *out.waca_v33;
+        const int H = static_cast<int>(hdr.reserved);
+        wv.mlp_hidden = H;
+        const size_t t1_bytes  = static_cast<size_t>(pt.total_raw_entries) * sizeof(int16_t);
+        const size_t emb_bytes = static_cast<size_t>(pt.key_raw_entries) * sizeof(WacaKeyEmb8);
+        const size_t ctr_bytes = static_cast<size_t>(WACA_V33_CTR_RAW_ENTRIES) * sizeof(WacaKeyEmb4);
+        for (int ply = 0; ply < NUM_PLIES; ++ply) {
+            if (!read_chunk(wv.tier1.w_ply[ply].data(), t1_bytes)) return fail("WACA v3.3 tier1 read error");
+        }
+        for (int ply = 0; ply < NUM_PLIES; ++ply) {
+            if (!read_chunk(wv.s25[ply].w, WACA_V33_F25 * sizeof(int16_t))) return fail("WACA v3.3 s25 w read error");
+        }
+        for (int ply = 0; ply < NUM_PLIES; ++ply) {
+            if (!read_chunk(&wv.s25[ply].b, sizeof(int32_t))) return fail("WACA v3.3 s25 b read error");
+        }
+        for (int b = 0; b < WACA_V33_EO_BLOCKS; ++b) {
+            if (!read_chunk(wv.h_emb[b].data(), emb_bytes)) return fail("WACA v3.3 h_emb read error");
+        }
+        for (int b = 0; b < WACA_V33_EO_BLOCKS; ++b) {
+            if (!read_chunk(wv.ctr_emb[b].data(), ctr_bytes)) return fail("WACA v3.3 ctr_emb read error");
+        }
+        for (int ply = 0; ply < NUM_PLIES; ++ply) {
+            if (!read_chunk(wv.screlu[ply].mu_key, 24 * sizeof(int16_t))) return fail("WACA v3.3 screlu mu_key read error");
+            if (!read_chunk(wv.screlu[ply].mu_ctr,  4 * sizeof(int16_t))) return fail("WACA v3.3 screlu mu_ctr read error");
+            if (!read_chunk(wv.screlu[ply].beta,   WACA_V33_SCRELU_TERMS * sizeof(int16_t))) return fail("WACA v3.3 screlu beta read error");
+        }
+        for (int ply = 0; ply < NUM_PLIES; ++ply) {
+            wv.mlp[ply] = WacaV33MlpPly{};
+            for (int j = 0; j < H; ++j) {
+                if (!read_chunk(wv.mlp[ply].w1[j], WACA_V33_F3 * sizeof(int8_t))) return fail("WACA v3.3 mlp w1 read error");
+            }
+        }
+        for (int ply = 0; ply < NUM_PLIES; ++ply) {
+            if (!read_chunk(wv.mlp[ply].b1, static_cast<size_t>(H) * sizeof(int32_t))) return fail("WACA v3.3 mlp b1 read error");
+        }
+        for (int ply = 0; ply < NUM_PLIES; ++ply) {
+            if (!read_chunk(wv.mlp[ply].w2, static_cast<size_t>(H) * sizeof(int16_t))) return fail("WACA v3.3 mlp w2 read error");
+        }
+        for (int ply = 0; ply < NUM_PLIES; ++ply) {
+            if (!read_chunk(&wv.mlp[ply].b2, sizeof(int32_t))) return fail("WACA v3.3 mlp b2 read error");
         }
     } else if (out.is_waca_v32) {
         out.waca_v32 = std::make_unique<WacaG2V32Weights>();

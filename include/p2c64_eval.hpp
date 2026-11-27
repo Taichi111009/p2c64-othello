@@ -51,7 +51,8 @@ enum class EvalMode : int {
     CAND_C_PTM_HYBRID     = 5,
     WACA_G2               = 6,
     WACA_G2_V31           = 7,
-    WACA_G2_V32           = 8
+    WACA_G2_V32           = 8,
+    WACA_G2_V33           = 9
 };
 
 // ============================================================================
@@ -2081,6 +2082,615 @@ inline int32_t eval_waca_g2_v32_gated(const WacaG2V32Weights& w,
     stat_s3++;
     const int32_t rt = is_w ? eval_waca_v32_stage3_ptm<true>(w, meta, idx, P, O, mvP, mvO, f, r25, ply)
                             : eval_waca_v32_stage3_ptm<false>(w, meta, idx, P, O, mvP, mvO, f, r25, ply);
+    return v1 + rt;
+}
+
+// ============================================================================
+// P2C-64 v3.3: WACA_G2_V33
+//   - Stage 2.5 : 12-dim polynomial gate (8 base + 4 cross terms, 0 extra loads/popcounts)
+//   - Stage 3   : 30-block EO Key-14 8ch (21.02 MiB) + Center-10 4ch (2.25 MiB)
+//                 + 44-term SCReLU/Pairwise/Center-Outer head + ply 24..31 ramp
+//                 + 60-ply 32 -> H(=16) -> 1 4-way j-tile pure-scalar MLP (0 SIMD!)
+// ============================================================================
+static constexpr int     WACA_V33_EO_BLOCKS       = 30;    // 15 x 2 (even/odd ply parity, max +/-1 ply drift!)
+static constexpr int     WACA_V33_F25             = 12;    // 8 base + 4 polynomial cross terms
+static constexpr int     WACA_V33_F3_EXTRA        = 16;    // f[8..23]: 4 bitboard + 4 ramp parity + 8 full-64 geom
+static constexpr int     WACA_V33_F3              = 32;    // 8 base + 16 extra + 8 sparse summary
+static constexpr int     WACA_V33_MAX_HID         = 24;    // 16 (optimal default) or up to 24
+static constexpr int     WACA_V33_CTR_PATTERNS    = 10;    // Line3(4) + Line4(4) + Center2x4(2)
+static constexpr int32_t WACA_V33_CTR_RAW_ENTRIES = 19683; // 3 * 3^8 (type4: 0..6560, type5: 6561..13121, type15: 13122..19682)
+static constexpr int     WACA_V33_SCRELU_TERMS    = 44;    // 12(g0) + 12(g1) + 12(g2) + 4(g3 ctr) + 4(g4 cross)
+static constexpr int32_t WACA_V33_SCRELU_BETA_MAX = 1023;  // 92 * 127^2 * 1023 = 1,517,996,964 < INT32_MAX!
+
+struct alignas(8) WacaKeyEmb8 {
+    int8_t h[8]{};
+};
+static_assert(sizeof(WacaKeyEmb8) == 8, "WacaKeyEmb8 must be 8 bytes (single 64-bit scalar load)");
+
+struct alignas(32) WacaV33Stage25Ply {
+    int16_t w[WACA_V33_F25]{}; // 24B
+    int32_t b = 0;             //  4B
+};
+
+struct alignas(16) WacaV33SCReLUPly {
+    int16_t mu_key[3][8]{};               // 48B: Group 0/1/2 x 8ch
+    int16_t mu_ctr[4]{};                  //  8B: Group 3 (Center-10) x 4ch
+    int16_t beta[WACA_V33_SCRELU_TERMS]{}; // 88B: 44-term linear combination (|beta| <= 1023)
+};
+static_assert(sizeof(WacaV33SCReLUPly) == 144, "WacaV33SCReLUPly must be 144 bytes");
+
+struct alignas(64) WacaV33MlpPly {
+    int8_t  w1[WACA_V33_MAX_HID][WACA_V33_F3]{}; // 768B (active H=16 uses 512B!)
+    int32_t b1[WACA_V33_MAX_HID]{};              //  96B
+    int16_t w2[WACA_V33_MAX_HID]{};              //  48B
+    int32_t b2 = 0;                              //   4B
+};
+
+struct WacaG2V33Weights {
+    int32_t                                          mlp_hidden = 16; // 16 (optimal default)
+    RawNTuple64Weights                               tier1;           // 46.92 MiB untouched RAW_64!
+    std::array<WacaV33Stage25Ply, NUM_PLIES>         s25{};           //  1.92 KiB (L1D)
+    std::array<std::vector<WacaKeyEmb8>, WACA_V33_EO_BLOCKS> h_emb;   // 21.02 MiB (Key-14 8ch, Stage 3 only!)
+    std::array<std::vector<WacaKeyEmb4>, WACA_V33_EO_BLOCKS> ctr_emb; //  2.25 MiB (Center-10 4ch, Stage 3 only!)
+    std::array<WacaV33SCReLUPly, NUM_PLIES>          screlu{};        //  8.64 KiB (L1D)
+    std::array<WacaV33MlpPly, NUM_PLIES>             mlp{};           // 36.7 KiB active (H=16)
+
+    WacaG2V33Weights() {
+        const auto& pt = get_pattern_tables();
+        for (int b = 0; b < WACA_V33_EO_BLOCKS; ++b) {
+            h_emb[b].assign(static_cast<size_t>(pt.key_raw_entries), WacaKeyEmb8{});
+            ctr_emb[b].assign(static_cast<size_t>(WACA_V33_CTR_RAW_ENTRIES), WacaKeyEmb4{});
+        }
+    }
+
+    // Strict D4 internal mirror symmetrization & overflow-safe parameter clamping
+    void symmetrize() {
+        tier1.symmetrize();
+        const auto& pt = get_pattern_tables();
+        auto clamp_i8 = [](int8_t v) -> int8_t { return (v == INT8_MIN) ? -127 : v; };
+
+        // 1) Key-14 8ch embeddings (types 0..3)
+        for (int b = 0; b < WACA_V33_EO_BLOCKS; ++b) {
+            WacaKeyEmb8* tbl = h_emb[b].data();
+            for (int t = 0; t < 4; ++t) {
+                const int32_t off = pt.type_raw_off[t];
+                const int32_t sz  = pt.type_raw_size[t];
+                const int ng      = pt.type_sym[t].num_gens;
+                std::vector<uint8_t> vis(static_cast<size_t>(sz), 0);
+                for (int32_t x = 0; x < sz; ++x) {
+                    if (vis[x]) continue;
+                    std::vector<int32_t> orb;
+                    orb.push_back(x);
+                    vis[x] = 1;
+                    for (size_t qi = 0; qi < orb.size(); ++qi) {
+                        int32_t cur = orb[qi];
+                        for (int g = 0; g < ng; ++g) {
+                            int32_t nxt = pt.permute_raw_index(t, g, cur);
+                            if (!vis[nxt]) {
+                                vis[nxt] = 1;
+                                orb.push_back(nxt);
+                            }
+                        }
+                    }
+                    WacaKeyEmb8 rep = tbl[off + x];
+                    for (int k = 0; k < 8; ++k) rep.h[k] = clamp_i8(rep.h[k]);
+                    for (int32_t idx : orb) tbl[off + idx] = rep;
+                }
+            }
+        }
+
+        // 2) Center-10 4ch embeddings (types 4, 5, 15 -> offsets 0, 6561, 13122)
+        static constexpr int CTR_TYPES[3] = {4, 5, 15};
+        for (int b = 0; b < WACA_V33_EO_BLOCKS; ++b) {
+            WacaKeyEmb4* tbl = ctr_emb[b].data();
+            for (int ci = 0; ci < 3; ++ci) {
+                const int t       = CTR_TYPES[ci];
+                const int32_t off = ci * 6561;
+                const int32_t sz  = pt.type_raw_size[t]; // 6561
+                const int ng      = pt.type_sym[t].num_gens;
+                std::vector<uint8_t> vis(static_cast<size_t>(sz), 0);
+                for (int32_t x = 0; x < sz; ++x) {
+                    if (vis[x]) continue;
+                    std::vector<int32_t> orb;
+                    orb.push_back(x);
+                    vis[x] = 1;
+                    for (size_t qi = 0; qi < orb.size(); ++qi) {
+                        int32_t cur = orb[qi];
+                        for (int g = 0; g < ng; ++g) {
+                            int32_t nxt = pt.permute_raw_index(t, g, cur);
+                            if (!vis[nxt]) {
+                                vis[nxt] = 1;
+                                orb.push_back(nxt);
+                            }
+                        }
+                    }
+                    WacaKeyEmb4 rep = tbl[off + x];
+                    for (int k = 0; k < 4; ++k) rep.h[k] = clamp_i8(rep.h[k]);
+                    for (int32_t idx : orb) tbl[off + idx] = rep;
+                }
+            }
+        }
+
+        mlp_hidden = std::clamp<int32_t>(mlp_hidden, 1, WACA_V33_MAX_HID);
+        for (int ply = 0; ply < NUM_PLIES; ++ply) {
+            s25[ply].b = std::clamp<int32_t>(s25[ply].b, -WACA_S25_B_MAX, WACA_S25_B_MAX);
+            for (int i = 0; i < WACA_V33_F25; ++i) {
+                s25[ply].w[i] = static_cast<int16_t>(
+                    std::clamp<int32_t>(s25[ply].w[i], -WACA_S25_W_MAX, WACA_S25_W_MAX));
+            }
+            for (int m = 0; m < WACA_V33_SCRELU_TERMS; ++m) {
+                screlu[ply].beta[m] = static_cast<int16_t>(
+                    std::clamp<int32_t>(screlu[ply].beta[m], -WACA_V33_SCRELU_BETA_MAX, WACA_V33_SCRELU_BETA_MAX));
+            }
+            mlp[ply].b2 = std::clamp<int32_t>(mlp[ply].b2, -WACA_MLP_B2_MAX, WACA_MLP_B2_MAX);
+            for (int j = 0; j < WACA_V33_MAX_HID; ++j) {
+                mlp[ply].b1[j] = std::clamp<int32_t>(mlp[ply].b1[j], -WACA_MLP_B1_MAX, WACA_MLP_B1_MAX);
+                mlp[ply].w2[j] = static_cast<int16_t>(
+                    std::clamp<int32_t>(mlp[ply].w2[j], -WACA_MLP_W2_MAX, WACA_MLP_W2_MAX));
+                for (int i = 0; i < WACA_V33_F3; ++i) {
+                    mlp[ply].w1[j][i] = clamp_i8(mlp[ply].w1[j][i]);
+                }
+            }
+        }
+    }
+};
+
+// v3.3 Stage 1: Identical 20-insn 64-pattern PTM loop (0.0% overhead on gated leaves!)
+template<bool IS_WHITE>
+__attribute__((noinline, noclone))
+int32_t eval_waca_v33_stage1_ptm(const RawNTuple64Weights& tier1,
+                                 const PatternMeta* __restrict meta,
+                                 const uint16_t* __restrict idx,
+                                 int ply) noexcept {
+    const int16_t* __restrict wp = tier1.w_ply[ply].data();
+    int32_t sum = 0;
+    for (int p = 0; p < NUM_PATTERNS; ++p) {
+        const int32_t flat = IS_WHITE ? (meta[p].raw_off_end - idx[p]) : (meta[p].raw_off + idx[p]);
+        sum += wp[flat];
+    }
+    return sum;
+}
+
+// v3.3 Stage 2.5 feature extraction: 12-dim polynomial (8 base + 4 cross terms, 0 extra loads/popcounts!)
+__attribute__((always_inline))
+static inline void extract_waca_v33_stage25_features(uint64_t P, uint64_t O,
+                                                     int32_t v1, int ply,
+                                                     int32_t f_out[WACA_V33_F25],
+                                                     uint64_t& out_mvP,
+                                                     uint64_t& out_mvO) noexcept {
+    extract_waca_v31_stage25_features(P, O, v1, ply, f_out, out_mvP, out_mvO);
+    const int32_t f0 = f_out[0];
+    const int32_t f6 = f_out[6];
+    f_out[8]  = clamp_feat_i32(sym_rshift(f0 * f_out[1], 8));
+    f_out[9]  = clamp_feat_i32(sym_rshift(f0 * f6, 8));
+    f_out[10] = clamp_feat_i32(sym_rshift(f0 * f_out[3], 8));
+    f_out[11] = clamp_feat_i32(sym_rshift(f6 * abs_i32(f6), 8));
+}
+
+// v3.3 Stage 2.5 Kernel: 12-Dim Polynomial Linear Gate (~62 ns, 0 SIMD, 0 PLT calls!)
+__attribute__((noinline, noclone))
+inline int32_t eval_waca_v33_stage25_kernel(const WacaG2V33Weights& w,
+                                            uint64_t P, uint64_t O,
+                                            int32_t v1, int ply,
+                                            int32_t f_out[WACA_V33_F25],
+                                            uint64_t& out_mvP,
+                                            uint64_t& out_mvO) noexcept {
+    extract_waca_v33_stage25_features(P, O, v1, ply, f_out, out_mvP, out_mvO);
+    const WacaV33Stage25Ply& sp = w.s25[ply];
+    const int32_t a0 = sp.b
+                     + static_cast<int32_t>(sp.w[0]) * f_out[0]
+                     + static_cast<int32_t>(sp.w[4]) * f_out[4]
+                     + static_cast<int32_t>(sp.w[8]) * f_out[8];
+    const int32_t a1 = static_cast<int32_t>(sp.w[1]) * f_out[1]
+                     + static_cast<int32_t>(sp.w[5]) * f_out[5]
+                     + static_cast<int32_t>(sp.w[9]) * f_out[9];
+    const int32_t a2 = static_cast<int32_t>(sp.w[2]) * f_out[2]
+                     + static_cast<int32_t>(sp.w[6]) * f_out[6]
+                     + static_cast<int32_t>(sp.w[10]) * f_out[10];
+    const int32_t a3 = static_cast<int32_t>(sp.w[3]) * f_out[3]
+                     + static_cast<int32_t>(sp.w[7]) * f_out[7]
+                     + static_cast<int32_t>(sp.w[11]) * f_out[11];
+    const int32_t acc = (a0 + a1) + (a2 + a3);
+    return std::clamp<int32_t>(sym_rshift(acc, WACA_S25_SHIFT), -WACA_MAX_RES, WACA_MAX_RES);
+}
+
+// v3.3 Stage 3 extra 16 features f[8..23] (shared verbatim by C++ inference & OpenMP training bridge!)
+//   f_ext[0..3]  = f[8..11]  : edge mobility, potential mobility, frontier, corner-edge+triangle stability
+//   f_ext[4..7]  = f[12..15] : smooth ply 24..31 ramp 4-neighbor empty-region parity (0 cost when ply <= 23!)
+//   f_ext[8..15] = f[16..23] : fused 24-load + 0-load outer_rest_sum full-64 geometry
+__attribute__((always_inline))
+static inline void extract_waca_v33_stage3_extra_features(uint64_t P, uint64_t O,
+                                                          uint64_t mvP, uint64_t mvO,
+                                                          int ply,
+                                                          const int32_t c[4], const int32_t e[4],
+                                                          int32_t c_sum, int32_t e_sum,
+                                                          int32_t ctr10_tier1_sum,
+                                                          int32_t outer_rest_sum,
+                                                          int32_t f_ext[WACA_V33_F3_EXTRA]) noexcept {
+    // f[8..11]: Bitboard features reusing mvP/mvO from Stage 2.5
+    constexpr uint64_t EDGES = 0xff818181818181ffULL;
+    const int32_t emobP = popcount64_swar(mvP & EDGES);
+    const int32_t emobO = popcount64_swar(mvO & EDGES);
+    const uint64_t E    = ~(P | O);
+    const int32_t potP  = popcount64_swar(adj_mask_bb(O) & E);
+    const int32_t potO  = popcount64_swar(adj_mask_bb(P) & E);
+    const uint64_t adjE = adj_mask_bb(E);
+    const int32_t frP   = popcount64_swar(P & adjE);
+    const int32_t frO   = popcount64_swar(O & adjE);
+    const int32_t stabP = count_edge_stable_bb(P);
+    const int32_t stabO = count_edge_stable_bb(O);
+
+    f_ext[0] = clamp_feat_i32((emobP - emobO) << 4);
+    f_ext[1] = clamp_feat_i32((potP - potO) << 4);
+    f_ext[2] = clamp_feat_i32((frP - frO) << 4);
+    f_ext[3] = clamp_feat_i32((stabP - stabO) << 4);
+
+    // f[12..15]: Smooth linear ramp over ply 24..31 (ramp = clamp(ply - 23, 0, 8), 0 cost when ply <= 23!)
+    const int32_t ramp = std::clamp<int32_t>(ply - 23, 0, 8);
+    if (ramp == 0) {
+        f_ext[4] = 0;
+        f_ext[5] = 0;
+        f_ext[6] = 0;
+        f_ext[7] = 0;
+    } else {
+        int32_t odd_cnt = 0, single_cnt = 0, odd_mv_diff = 0, reg_cnt = 0;
+        const uint64_t adjE4 = ((E << 1) & 0xfefefefefefefefeULL)
+                             | ((E >> 1) & 0x7f7f7f7f7f7f7f7fULL)
+                             | (E << 8)
+                             | (E >> 8);
+        const uint64_t singles = E & ~adjE4;
+        if (singles) {
+            single_cnt  = popcount64_swar(singles);
+            odd_cnt     = single_cnt;
+            reg_cnt     = single_cnt;
+            odd_mv_diff = popcount64_swar(singles & mvP) - popcount64_swar(singles & mvO);
+        }
+        uint64_t rem = E ^ singles;
+        while (rem) {
+            uint64_t comp = rem & (~rem + 1ULL);
+            uint64_t prev;
+            do {
+                prev = comp;
+                comp |= (((comp << 1) & 0xfefefefefefefefeULL)
+                       | ((comp >> 1) & 0x7f7f7f7f7f7f7f7fULL)
+                       | (comp << 8)
+                       | (comp >> 8)) & rem;
+                comp |= (((comp << 1) & 0xfefefefefefefefeULL)
+                       | ((comp >> 1) & 0x7f7f7f7f7f7f7f7fULL)
+                       | (comp << 8)
+                       | (comp >> 8)) & rem;
+            } while (comp != prev);
+            rem ^= comp;
+            reg_cnt++;
+            const int32_t sz = (reg_cnt == 1 && rem == 0ULL) ? (60 - ply) : popcount64_swar(comp);
+            if (sz & 1) {
+                odd_cnt++;
+                odd_mv_diff += ((comp & mvP) != 0ULL ? 1 : 0) - ((comp & mvO) != 0ULL ? 1 : 0);
+            }
+        }
+        const int32_t raw0 = (odd_cnt - 1) << 5;
+        const int32_t raw1 = single_cnt << 6;
+        const int32_t raw2 = odd_mv_diff << 6;
+        const int32_t raw3 = (reg_cnt - 2) << 5;
+        if (ramp < 8) {
+            f_ext[4] = clamp_feat_i32(sym_rshift(raw0 * ramp, 3));
+            f_ext[5] = clamp_feat_i32(sym_rshift(raw1 * ramp, 3));
+            f_ext[6] = clamp_feat_i32(sym_rshift(raw2 * ramp, 3));
+            f_ext[7] = clamp_feat_i32(sym_rshift(raw3 * ramp, 3));
+        } else {
+            f_ext[4] = clamp_feat_i32(raw0);
+            f_ext[5] = clamp_feat_i32(raw1);
+            f_ext[6] = clamp_feat_i32(raw2);
+            f_ext[7] = clamp_feat_i32(raw3);
+        }
+    }
+
+    // f[16..23]: Full 64-pattern geometric stats (fused 24-load + 0-load outer_rest_sum)
+    int32_t c_min = c[0], c_max = c[0];
+    for (int i = 1; i < 4; ++i) {
+        if (c[i] < c_min) c_min = c[i];
+        if (c[i] > c_max) c_max = c[i];
+    }
+
+    int32_t cs[4], es[4];
+    for (int i = 0; i < 4; ++i) {
+        cs[i] = std::clamp<int32_t>(sym_rshift(c[i], 4), -256, 256);
+        es[i] = std::clamp<int32_t>(sym_rshift(e[i], 4), -256, 256);
+    }
+    const int32_t diag_prod = cs[0] * cs[2] + cs[1] * cs[3];
+    const int32_t adj_diff  = abs_i32(cs[0] - cs[1]) + abs_i32(cs[1] - cs[2])
+                            + abs_i32(cs[2] - cs[3]) + abs_i32(cs[3] - cs[0]);
+    const int32_t diag_diff = abs_i32(cs[0] - cs[2]) + abs_i32(cs[1] - cs[3]);
+    const int32_t polar     = adj_diff - 2 * diag_diff;
+    const int32_t ce_coup   = cs[0] * (es[0] + es[3]) + cs[1] * (es[1] + es[0])
+                            + cs[2] * (es[2] + es[1]) + cs[3] * (es[3] + es[2]);
+
+    f_ext[8]  = clamp_feat_i32(sym_rshift(c_sum, 3));
+    f_ext[9]  = clamp_feat_i32(sym_rshift(e_sum, 3));
+    f_ext[10] = clamp_feat_i32(sym_rshift(c_max - c_min, 3));
+    f_ext[11] = clamp_feat_i32(sym_rshift(diag_prod, 6));
+    f_ext[12] = clamp_feat_i32(sym_rshift(polar, 1));
+    f_ext[13] = clamp_feat_i32(sym_rshift(ce_coup, 7));
+    f_ext[14] = clamp_feat_i32(sym_rshift(ctr10_tier1_sum, 3));
+    f_ext[15] = clamp_feat_i32(sym_rshift(outer_rest_sum, 3));
+}
+
+// v3.3 Stage 3 Kernel: Key-14 8ch + Center-10 4ch + 44-term Pairwise SCReLU + 4-way j-Tile 32->H->1 MLP (0 SIMD!)
+// Expects contiguous f[WACA_V33_F3] with f[0..7] already populated by Stage 2.5 (0 copy!).
+template<bool IS_WHITE>
+__attribute__((noinline, noclone))
+int32_t eval_waca_v33_stage3_ptm(const WacaG2V33Weights& w,
+                                 const PatternMeta* __restrict meta,
+                                 const uint16_t* __restrict idx,
+                                 uint64_t P, uint64_t O,
+                                 uint64_t mvP, uint64_t mvO,
+                                 int32_t v1,
+                                 int32_t* __restrict f,
+                                 int32_t r25,
+                                 int ply) noexcept {
+    const int16_t* __restrict wp = w.tier1.w_ply[ply].data();
+    const uint8_t eo_blk = PLY_TO_EO30_BLK[ply];
+    const WacaKeyEmb8* __restrict htbl = w.h_emb[eo_blk].data();
+    const WacaKeyEmb4* __restrict ctbl = w.ctr_emb[eo_blk].data();
+
+    // 1) Fused p=0..13 loop: single flat index loads BOTH L1D-hot wp[flat] & 8-byte htbl[flat]!
+    int32_t c[4], e[4];
+    int32_t c_sum = 0, e_sum = 0, l2d8_sum = 0;
+    int32_t h[NUM_KEY_PATTERNS][8];
+    int32_t g[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+    for (int p = 0; p < 4; ++p) {
+        const int32_t flat = IS_WHITE ? (meta[p].raw_off_end - idx[p]) : (meta[p].raw_off + idx[p]);
+        const int32_t wv = wp[flat];
+        c[p] = wv;
+        c_sum += wv;
+        const WacaKeyEmb8 emb = htbl[flat];
+        for (int k = 0; k < 8; ++k) {
+            const int32_t ev = emb.h[k];
+            h[p][k] = ev;
+            g[k] += ev;
+        }
+    }
+    for (int p = 4; p < 8; ++p) {
+        const int32_t flat = IS_WHITE ? (meta[p].raw_off_end - idx[p]) : (meta[p].raw_off + idx[p]);
+        const int32_t wv = wp[flat];
+        e[p - 4] = wv;
+        e_sum += wv;
+        const WacaKeyEmb8 emb = htbl[flat];
+        for (int k = 0; k < 8; ++k) {
+            const int32_t ev = emb.h[k];
+            h[p][k] = ev;
+            g[k] += ev;
+        }
+    }
+    for (int p = 8; p < NUM_KEY_PATTERNS; ++p) {
+        const int32_t flat = IS_WHITE ? (meta[p].raw_off_end - idx[p]) : (meta[p].raw_off + idx[p]);
+        l2d8_sum += wp[flat];
+        const WacaKeyEmb8 emb = htbl[flat];
+        for (int k = 0; k < 8; ++k) {
+            const int32_t ev = emb.h[k];
+            h[p][k] = ev;
+            g[k] += ev;
+        }
+    }
+
+    // 2) Fused Center-10 loop (p=14..17 Line3, p=18..21 Line4, p=62..63 Center2x4)
+    int32_t ctr10_tier1_sum = 0;
+    int32_t gc0 = 0, gc1 = 0, gc2 = 0, gc3 = 0;
+    for (int p = 14; p < 18; ++p) {
+        const int32_t flat  = IS_WHITE ? (meta[p].raw_off_end - idx[p]) : (meta[p].raw_off + idx[p]);
+        const int32_t cflat = IS_WHITE ? (6560 - static_cast<int32_t>(idx[p])) : static_cast<int32_t>(idx[p]);
+        ctr10_tier1_sum += wp[flat];
+        const WacaKeyEmb4 ce = ctbl[cflat];
+        gc0 += ce.h[0]; gc1 += ce.h[1]; gc2 += ce.h[2]; gc3 += ce.h[3];
+    }
+    for (int p = 18; p < 22; ++p) {
+        const int32_t flat  = IS_WHITE ? (meta[p].raw_off_end - idx[p]) : (meta[p].raw_off + idx[p]);
+        const int32_t cflat = IS_WHITE ? (13121 - static_cast<int32_t>(idx[p])) : (6561 + static_cast<int32_t>(idx[p]));
+        ctr10_tier1_sum += wp[flat];
+        const WacaKeyEmb4 ce = ctbl[cflat];
+        gc0 += ce.h[0]; gc1 += ce.h[1]; gc2 += ce.h[2]; gc3 += ce.h[3];
+    }
+    for (int p = 62; p < 64; ++p) {
+        const int32_t flat  = IS_WHITE ? (meta[p].raw_off_end - idx[p]) : (meta[p].raw_off + idx[p]);
+        const int32_t cflat = IS_WHITE ? (19682 - static_cast<int32_t>(idx[p])) : (13122 + static_cast<int32_t>(idx[p]));
+        ctr10_tier1_sum += wp[flat];
+        const WacaKeyEmb4 ce = ctbl[cflat];
+        gc0 += ce.h[0]; gc1 += ce.h[1]; gc2 += ce.h[2]; gc3 += ce.h[3];
+    }
+    // 0-load exact restoration of remaining 40 outer patterns!
+    const int32_t outer_rest_sum = v1 - (c_sum + e_sum + l2d8_sum + ctr10_tier1_sum);
+
+    // 3) Populate f[8..23] in-place (f[0..7] already written by Stage 2.5 -> 0 copy, 0 xmm!)
+    extract_waca_v33_stage3_extra_features(P, O, mvP, mvO, ply, c, e,
+                                           c_sum, e_sum, ctr10_tier1_sum, outer_rest_sum, f + 8);
+
+    // 4) 44-term SCReLU + Pairwise + Center-Outer Cross-Coupling Head
+    const WacaV33SCReLUPly& sc = w.screlu[ply];
+    int32_t s0_sq[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    int32_t p0[4]    = {0, 0, 0, 0};
+    for (int r = 0; r < 4; ++r) {
+        const int c1 = (r + 1) & 3;
+        int32_t u[8];
+        for (int k = 0; k < 8; ++k) {
+            u[k] = clamp_i32(h[4 + r][k] + h[8 + r][k] + h[r][k] + h[c1][k] + sc.mu_key[0][k], SCRELU_Q);
+            s0_sq[k] += u[k] * u[k];
+        }
+        p0[0] += u[0] * u[4];
+        p0[1] += u[1] * u[5];
+        p0[2] += u[2] * u[6];
+        p0[3] += u[3] * u[7];
+    }
+
+    int32_t s1_sq[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    int32_t p1[4]    = {0, 0, 0, 0};
+    for (int d = 0; d < 2; ++d) {
+        int32_t u[8];
+        for (int k = 0; k < 8; ++k) {
+            u[k] = clamp_i32(h[12 + d][k] + h[d][k] + h[d + 2][k] + sc.mu_key[1][k], SCRELU_Q);
+            s1_sq[k] += u[k] * u[k];
+        }
+        p1[0] += u[0] * u[4];
+        p1[1] += u[1] * u[5];
+        p1[2] += u[2] * u[6];
+        p1[3] += u[3] * u[7];
+    }
+
+    int32_t ug[8], s2_sq[8], p2[4];
+    for (int k = 0; k < 8; ++k) {
+        ug[k]    = clamp_i32(g[k] + sc.mu_key[2][k], SCRELU_Q);
+        s2_sq[k] = ug[k] * ug[k];
+    }
+    p2[0] = ug[0] * ug[4];
+    p2[1] = ug[1] * ug[5];
+    p2[2] = ug[2] * ug[6];
+    p2[3] = ug[3] * ug[7];
+
+    const int32_t uc0 = clamp_i32(gc0 + sc.mu_ctr[0], SCRELU_Q);
+    const int32_t uc1 = clamp_i32(gc1 + sc.mu_ctr[1], SCRELU_Q);
+    const int32_t uc2 = clamp_i32(gc2 + sc.mu_ctr[2], SCRELU_Q);
+    const int32_t uc3 = clamp_i32(gc3 + sc.mu_ctr[3], SCRELU_Q);
+    const int32_t s3_sq[4] = {uc0 * uc0, uc1 * uc1, uc2 * uc2, uc3 * uc3};
+    const int32_t pc[4]    = {ug[0] * uc0, ug[1] * uc1, ug[2] * uc2, ug[3] * uc3};
+
+    int32_t sc_acc = 0;
+    for (int k = 0; k < 8; ++k) sc_acc += static_cast<int32_t>(sc.beta[0 + k])  * s0_sq[k];
+    for (int k = 0; k < 4; ++k) sc_acc += static_cast<int32_t>(sc.beta[8 + k])  * p0[k];
+    for (int k = 0; k < 8; ++k) sc_acc += static_cast<int32_t>(sc.beta[12 + k]) * s1_sq[k];
+    for (int k = 0; k < 4; ++k) sc_acc += static_cast<int32_t>(sc.beta[20 + k]) * p1[k];
+    for (int k = 0; k < 8; ++k) sc_acc += static_cast<int32_t>(sc.beta[24 + k]) * s2_sq[k];
+    for (int k = 0; k < 4; ++k) sc_acc += static_cast<int32_t>(sc.beta[32 + k]) * p2[k];
+    for (int k = 0; k < 4; ++k) sc_acc += static_cast<int32_t>(sc.beta[36 + k]) * s3_sq[k];
+    for (int k = 0; k < 4; ++k) sc_acc += static_cast<int32_t>(sc.beta[40 + k]) * pc[k];
+    const int32_t r_key_screlu = sym_rshift(sc_acc, SCRELU_SHIFT);
+
+    // 5) f[24..31]: 8 sparse nonlinear summary features
+    for (int k = 0; k < 4; ++k) {
+        const int32_t sum_k = (s0_sq[k] + s1_sq[k] + s2_sq[k]) + (s0_sq[k + 4] + s1_sq[k + 4] + s2_sq[k + 4]);
+        f[24 + k] = clamp_feat_i32(sum_k >> 9);
+    }
+    f[28] = clamp_feat_i32((p0[0] + p1[0] + p2[0] + p0[1] + p1[1] + p2[1]) >> 9);
+    f[29] = clamp_feat_i32((p0[2] + p1[2] + p2[2] + p0[3] + p1[3] + p2[3]) >> 9);
+    f[30] = clamp_feat_i32((s3_sq[0] + s3_sq[1] + s3_sq[2] + s3_sq[3]) >> 8);
+    f[31] = clamp_feat_i32((pc[0] + pc[1] + pc[2] + pc[3]) >> 8);
+
+    // 6) 60-ply Compact Low-Jitter Pure-Integer SCReLU MLP (32 -> H[=16] -> 1, 4-way j-tile scalar ILP!)
+    const WacaV33MlpPly& mp = w.mlp[ply];
+    const int H = w.mlp_hidden;
+    int32_t acc2 = mp.b2;
+    int j = 0;
+    for (; j + 3 < H; j += 4) {
+        const int8_t* __restrict w0 = mp.w1[j + 0];
+        const int8_t* __restrict w1 = mp.w1[j + 1];
+        const int8_t* __restrict w2 = mp.w1[j + 2];
+        const int8_t* __restrict w3 = mp.w1[j + 3];
+        int32_t z0 = mp.b1[j + 0];
+        int32_t z1 = mp.b1[j + 1];
+        int32_t z2 = mp.b1[j + 2];
+        int32_t z3 = mp.b1[j + 3];
+        for (int i = 0; i < WACA_V33_F3; ++i) {
+            const int32_t fv = f[i];
+            z0 += static_cast<int32_t>(w0[i]) * fv;
+            z1 += static_cast<int32_t>(w1[i]) * fv;
+            z2 += static_cast<int32_t>(w2[i]) * fv;
+            z3 += static_cast<int32_t>(w3[i]) * fv;
+        }
+        const int32_t u0 = (z0 <= 0) ? 0 : (((z0 >> WACA_MLP_S1) > SCRELU_Q) ? SCRELU_Q : (z0 >> WACA_MLP_S1));
+        const int32_t u1 = (z1 <= 0) ? 0 : (((z1 >> WACA_MLP_S1) > SCRELU_Q) ? SCRELU_Q : (z1 >> WACA_MLP_S1));
+        const int32_t u2 = (z2 <= 0) ? 0 : (((z2 >> WACA_MLP_S1) > SCRELU_Q) ? SCRELU_Q : (z2 >> WACA_MLP_S1));
+        const int32_t u3 = (z3 <= 0) ? 0 : (((z3 >> WACA_MLP_S1) > SCRELU_Q) ? SCRELU_Q : (z3 >> WACA_MLP_S1));
+        acc2 += static_cast<int32_t>(mp.w2[j + 0]) * (u0 * u0)
+              + static_cast<int32_t>(mp.w2[j + 1]) * (u1 * u1)
+              + static_cast<int32_t>(mp.w2[j + 2]) * (u2 * u2)
+              + static_cast<int32_t>(mp.w2[j + 3]) * (u3 * u3);
+    }
+    for (; j < H; ++j) {
+        const int8_t* __restrict w0 = mp.w1[j];
+        int32_t z = mp.b1[j];
+        for (int i = 0; i < WACA_V33_F3; ++i) {
+            z += static_cast<int32_t>(w0[i]) * f[i];
+        }
+        const int32_t u = (z <= 0) ? 0 : (((z >> WACA_MLP_S1) > SCRELU_Q) ? SCRELU_Q : (z >> WACA_MLP_S1));
+        acc2 += static_cast<int32_t>(mp.w2[j]) * (u * u);
+    }
+    const int32_t r_mlp = sym_rshift(acc2, WACA_MLP_S2);
+
+    return std::clamp<int32_t>(r25 + r_mlp + r_key_screlu, -WACA_MAX_RES, WACA_MAX_RES);
+}
+
+// Evaluate all 3 stages unconditionally (used for bit-exact testing, Val RMSE, and GateMode::FULL)
+inline void eval_waca_g2_v33_stages(const WacaG2V33Weights& w,
+                                    const PatternMeta* __restrict meta,
+                                    const uint16_t* __restrict idx,
+                                    uint64_t B, uint64_t W, int stm, int ply,
+                                    int32_t& out_v1, int32_t& out_v25, int32_t& out_v3) noexcept {
+    const bool is_w = (stm < 0);
+    const uint64_t P = is_w ? W : B;
+    const uint64_t O = is_w ? B : W;
+    alignas(64) int32_t f[WACA_V33_F3];
+    uint64_t mvP = 0, mvO = 0;
+    const int32_t v1  = is_w ? eval_waca_v33_stage1_ptm<true>(w.tier1, meta, idx, ply)
+                             : eval_waca_v33_stage1_ptm<false>(w.tier1, meta, idx, ply);
+    const int32_t r25 = eval_waca_v33_stage25_kernel(w, P, O, v1, ply, f, mvP, mvO);
+    const int32_t rt  = is_w ? eval_waca_v33_stage3_ptm<true>(w, meta, idx, P, O, mvP, mvO, v1, f, r25, ply)
+                             : eval_waca_v33_stage3_ptm<false>(w, meta, idx, P, O, mvP, mvO, v1, f, r25, ply);
+    out_v1  = v1;
+    out_v25 = v1 + r25;
+    out_v3  = v1 + rt;
+}
+
+inline int32_t eval_waca_g2_v33_full(const WacaG2V33Weights& w,
+                                     const PatternMeta* __restrict meta,
+                                     const uint16_t* __restrict idx,
+                                     uint64_t B, uint64_t W, int stm, int ply) noexcept {
+    int32_t v1 = 0, v25 = 0, v3 = 0;
+    eval_waca_g2_v33_stages(w, meta, idx, B, W, stm, ply, v1, v25, v3);
+    return v3;
+}
+
+// Search-integrated 2-stage gated evaluator for WACA_G2_V33 (SAFE_BND / FAIL_HARD / FULL / WIDE_SAFE_BND)
+inline int32_t eval_waca_g2_v33_gated(const WacaG2V33Weights& w,
+                                      const PatternMeta* __restrict meta,
+                                      const uint16_t* __restrict idx,
+                                      uint64_t B, uint64_t W, int stm, int ply,
+                                      int32_t alpha, int32_t beta,
+                                      bool in_mpc_probe,
+                                      GateMode gate_mode,
+                                      int32_t m25_units,
+                                      int32_t m3_units,
+                                      uint64_t& stat_s25,
+                                      uint64_t& stat_s3,
+                                      int32_t tt_guard_units = 576) noexcept {
+    const bool is_w = (stm < 0);
+    const int32_t v1 = is_w ? eval_waca_v33_stage1_ptm<true>(w.tier1, meta, idx, ply)
+                            : eval_waca_v33_stage1_ptm<false>(w.tier1, meta, idx, ply);
+
+    if (in_mpc_probe) return v1;
+
+    const bool is_pv = (beta > alpha + 1);
+    if (!is_pv && gate_mode != GateMode::FULL) {
+        if (v1 + m25_units <= alpha) return gate_return_low(gate_mode, v1, m25_units, tt_guard_units, alpha);
+        if (v1 - m25_units >= beta)  return gate_return_high(gate_mode, v1, m25_units, tt_guard_units, beta);
+    }
+
+    // 12-dim polynomial Stage 2.5 (~62 ns, 0 Tier-1 reloads, 3 SWAR popcounts!)
+    stat_s25++;
+    const uint64_t P = is_w ? W : B;
+    const uint64_t O = is_w ? B : W;
+    alignas(64) int32_t f[WACA_V33_F3];
+    uint64_t mvP = 0, mvO = 0;
+    const int32_t r25 = eval_waca_v33_stage25_kernel(w, P, O, v1, ply, f, mvP, mvO);
+    const int32_t v25 = v1 + r25;
+
+    if (!is_pv && gate_mode != GateMode::FULL) {
+        if (v25 + m3_units <= alpha) return gate_return_low(gate_mode, v25, m3_units, tt_guard_units, alpha);
+        if (v25 - m3_units >= beta)  return gate_return_high(gate_mode, v25, m3_units, tt_guard_units, beta);
+    }
+
+    // Sparse-rich Stage 3 (~5% leaves: Key-14 8ch + Center-10 4ch + 44-term Pairwise SCReLU + H=16 j-tile MLP)
+    stat_s3++;
+    const int32_t rt = is_w ? eval_waca_v33_stage3_ptm<true>(w, meta, idx, P, O, mvP, mvO, v1, f, r25, ply)
+                            : eval_waca_v33_stage3_ptm<false>(w, meta, idx, P, O, mvP, mvO, v1, f, r25, ply);
     return v1 + rt;
 }
 
