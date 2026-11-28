@@ -572,6 +572,59 @@ int main() {
                 (s25_v33_ns * 0.15 + s3_v33_h16_cold * 0.05) - (s25_v32_ns * 0.15 + s3_v32_h16_cold * 0.05),
                 static_cast<unsigned long long>(sink_33 & 0xFF));
 
+    // ------------------------------------------------------------------------
+    // P2C-64 v4.0 (Path A-I): 100%-Leaf On-Demand SWAR-Packed Single-Pass Benchmarks
+    // ------------------------------------------------------------------------
+    auto make_swar_v40 = [&](int ch, int blks, int loc) -> SwarV40Weights {
+        SwarV40Weights sw(ch, blks, loc);
+        sw.tier1 = raw;
+        const size_t n_key = static_cast<size_t>(pt.key_raw_entries);
+        std::vector<int8_t> buf(static_cast<size_t>(blks) * n_key * static_cast<size_t>(ch));
+        for (int8_t& v : buf) v = static_cast<int8_t>((rng.next() & 127U) - 64);
+        sw.pack_from_i8(buf.data());
+        for (int ply = 0; ply < NUM_PLIES; ++ply) {
+            for (int k = 0; k < 8; ++k) sw.head[ply].mu_g[k] = static_cast<int16_t>((k & 1) ? 16 : -12);
+            for (int k = 0; k < 4; ++k) {
+                sw.head[ply].mu_e[k]   = 12;
+                sw.head[ply].mu_d[k]   = 10;
+                sw.head[ply].beta_e[k] = static_cast<int16_t>((k & 1) ? -32 : 40);
+                sw.head[ply].beta_d[k] = static_cast<int16_t>((k & 1) ? 28 : -24);
+            }
+            for (int m = 0; m < 12; ++m) {
+                sw.head[ply].beta_g[m] = static_cast<int16_t>((m & 1) ? -48 : 64);
+            }
+            sw.head[ply].b_ply = static_cast<int32_t>((ply - 30) * 2);
+        }
+        sw.prepare_all_heads();
+        return sw;
+    };
+
+    SwarV40Weights sw4_30_g = make_swar_v40(4, 30, 0);
+    SwarV40Weights sw4_30_l = make_swar_v40(4, 30, 1);
+    SwarV40Weights sw8_02_g = make_swar_v40(8,  2, 0);
+    SwarV40Weights sw8_30_g = make_swar_v40(8, 30, 0);
+    SwarV40Weights sw8_30_l = make_swar_v40(8, 30, 1);
+
+    std::printf("\n=== P2C-64 v4.0 (SWAR_V40) 100%%-Leaf On-Demand SWAR-Packed Benchmarks (Zero SIMD) ===\n");
+    std::printf("%-28s | %-30s | %-30s | %s\n",
+                "Mode", "Eval-only (DFS tree)", "Eval + 256 MiB TT", "Chk");
+    std::printf("-----------------------------+--------------------------------+--------------------------------+-----\n");
+    bench_one("11. SWAR_V40 4ch 30b loc=0", leaves, tt,
+        [&](const uint16_t* idx, int stm, int ply) { return eval_swar_v40(sw4_30_g, pt.meta, idx, stm, ply); },
+        ref_eval, ref_tt);
+    bench_one("12. SWAR_V40 4ch 30b loc=1", leaves, tt,
+        [&](const uint16_t* idx, int stm, int ply) { return eval_swar_v40(sw4_30_l, pt.meta, idx, stm, ply); },
+        ref_eval, ref_tt);
+    bench_one("13. SWAR_V40 8ch  2b loc=0", leaves, tt,
+        [&](const uint16_t* idx, int stm, int ply) { return eval_swar_v40(sw8_02_g, pt.meta, idx, stm, ply); },
+        ref_eval, ref_tt);
+    bench_one("14. SWAR_V40 8ch 30b loc=0", leaves, tt,
+        [&](const uint16_t* idx, int stm, int ply) { return eval_swar_v40(sw8_30_g, pt.meta, idx, stm, ply); },
+        ref_eval, ref_tt);
+    bench_one("15. SWAR_V40 8ch 30b loc=1", leaves, tt,
+        [&](const uint16_t* idx, int stm, int ply) { return eval_swar_v40(sw8_30_l, pt.meta, idx, stm, ply); },
+        ref_eval, ref_tt);
+
     std::free(tt);
     return 0;
 }

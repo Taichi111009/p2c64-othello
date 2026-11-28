@@ -153,10 +153,14 @@ static void print_usage(const char* prog) {
     std::printf("  --tt-mb <MB>                  TT size per player in MiB (default: 64)\n");
     std::printf("  --mpc / --no-mpc              Enable/disable standard Multi-ProbCut (default: off)\n");
     std::printf("  --mpc-t <val>                 MPC sigma multiplier (default: 1.80)\n");
+    std::printf("  --mpc-mode legacy|cal|eg_d2   MPC depth-pair schedule (default: legacy)\n");
+    std::printf("  --mpc-dyn-t / --no-mpc-dyn-t  Endgame-proximity dynamic MPC t schedule (default: off)\n");
     std::printf("  --mpc-cal <csv>               Load per-model MPC calibration CSV for both P1 and P2\n");
     std::printf("  --mpc-cal-p1 <csv>            Load MPC calibration CSV for P1 only\n");
     std::printf("  --mpc-cal-p2 <csv>            Load MPC calibration CSV for P2 only\n");
     std::printf("  --mpc-pure-v64 / --no-mpc-pure-v64  Use Tier-1 V1 only on MPC probe leaves (default: off)\n");
+    std::printf("  --mg-lmr / --no-mg-lmr        Enable eval-margin-gated LMR D3_mgLMR (default: off)\n");
+    std::printf("  --mg-lmr-margin <discs>       Margin in discs for mg-lmr (default: 4.0)\n");
     std::printf("  --m25 <discs>                 WACA-G2 Stage 1->2.5 gate margin in discs (default: 2.5)\n");
     std::printf("  --m3 <discs>                  WACA-G2 Stage 2.5->3 gate margin in discs (default: 1.5)\n");
     std::printf("  --tt-guard <discs>            WIDE_SAFE_BND TT safety margin in discs (default: 4.5)\n");
@@ -173,6 +177,7 @@ static void print_usage(const char* prog) {
 int main(int argc, char** argv) {
     std::string p1_path, p2_path, csv_path;
     std::string mode_str      = "depth";
+    std::string mpc_mode_str  = "legacy";
     std::string gate_mode_str = "safe_bnd";
     std::string dyn_gate_str  = "off";
     std::string mo_str        = "static";
@@ -184,8 +189,11 @@ int main(int argc, char** argv) {
     int endgame_empties       = 10;
     size_t tt_mb              = 64;
     bool use_mpc              = false;
+    bool mpc_dyn_t            = false;
     bool mpc_pure_v64         = false;
+    bool use_mg_lmr           = false;
     double mpc_t              = 1.80;
+    double mg_lmr_margin      = 4.0;
     double m25_discs          = 2.5;
     double m3_discs           = 1.5;
     double tt_guard_discs     = 4.5;
@@ -204,12 +212,18 @@ int main(int argc, char** argv) {
         else if (arg == "--tt-mb" && i + 1 < argc)           tt_mb = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
         else if (arg == "--mpc")                             use_mpc = true;
         else if (arg == "--no-mpc")                          use_mpc = false;
+        else if (arg == "--mpc-mode" && i + 1 < argc)        mpc_mode_str = argv[++i];
+        else if (arg == "--mpc-dyn-t")                       mpc_dyn_t = true;
+        else if (arg == "--no-mpc-dyn-t")                    mpc_dyn_t = false;
         else if (arg == "--mpc-pure-v64")                    mpc_pure_v64 = true;
         else if (arg == "--no-mpc-pure-v64")                 mpc_pure_v64 = false;
         else if (arg == "--mpc-t" && i + 1 < argc)           mpc_t = std::atof(argv[++i]);
         else if (arg == "--mpc-cal" && i + 1 < argc)         mpc_cal_all = argv[++i];
         else if (arg == "--mpc-cal-p1" && i + 1 < argc)      mpc_cal_p1 = argv[++i];
         else if (arg == "--mpc-cal-p2" && i + 1 < argc)      mpc_cal_p2 = argv[++i];
+        else if (arg == "--mg-lmr")                          use_mg_lmr = true;
+        else if (arg == "--no-mg-lmr")                       use_mg_lmr = false;
+        else if (arg == "--mg-lmr-margin" && i + 1 < argc)   mg_lmr_margin = std::atof(argv[++i]);
         else if (arg == "--m25" && i + 1 < argc)             m25_discs = std::atof(argv[++i]);
         else if (arg == "--m3" && i + 1 < argc)              m3_discs = std::atof(argv[++i]);
         else if (arg == "--tt-guard" && i + 1 < argc)        tt_guard_discs = std::atof(argv[++i]);
@@ -236,6 +250,12 @@ int main(int argc, char** argv) {
     else if (mode_str == "nodes") mode = SearchLimitMode::NODES;
     else if (mode_str == "time")  mode = SearchLimitMode::TIME;
     else { std::fprintf(stderr, "ERROR: Invalid --mode '%s'\n", mode_str.c_str()); return 1; }
+
+    MpcMode mpc_mode = MpcMode::LEGACY;
+    if (mpc_mode_str == "legacy")      mpc_mode = MpcMode::LEGACY;
+    else if (mpc_mode_str == "cal")    mpc_mode = MpcMode::CAL;
+    else if (mpc_mode_str == "eg_d2")  mpc_mode = MpcMode::EG_D2;
+    else { std::fprintf(stderr, "ERROR: Invalid --mpc-mode '%s' (expected legacy|cal|eg_d2)\n", mpc_mode_str.c_str()); return 1; }
 
     GateMode gate_mode = GateMode::SAFE_BND;
     if (gate_mode_str == "safe_bnd")           gate_mode = GateMode::SAFE_BND;
@@ -277,8 +297,14 @@ int main(int argc, char** argv) {
     PVSEngine eng2(&m2, tt_mb, endgame_empties);
     eng1.set_mpc(use_mpc, mpc_t);
     eng2.set_mpc(use_mpc, mpc_t);
+    eng1.set_mpc_mode(mpc_mode);
+    eng2.set_mpc_mode(mpc_mode);
+    eng1.set_mpc_dyn_t(mpc_dyn_t);
+    eng2.set_mpc_dyn_t(mpc_dyn_t);
     eng1.set_mpc_pure_v64(mpc_pure_v64);
     eng2.set_mpc_pure_v64(mpc_pure_v64);
+    eng1.set_mg_lmr(use_mg_lmr, mg_lmr_margin);
+    eng2.set_mg_lmr(use_mg_lmr, mg_lmr_margin);
     eng1.set_move_order_mode(mo_p1);
     eng2.set_move_order_mode(mo_p2);
     eng1.set_waca_gate(gate_mode, m25_discs, m3_discs, tt_guard_discs);
@@ -313,10 +339,11 @@ int main(int argc, char** argv) {
     std::printf("=== P2C-64 Pure-Scalar PVS Paired Match Engine ===\n");
     std::printf("P1 (%s): %s\n", eval_mode_name(m1.mode), p1_path.c_str());
     std::printf("P2 (%s): %s\n", eval_mode_name(m2.mode), p2_path.c_str());
-    std::printf("Config: mode=%s limit=%lld | pairs=%d (%d games) | open=%d ply | endgame=%d empties | TT=%zu MiB | MPC=%s(t=%.2f,cal=%s) | mpc_pure_v64=%s | mo=%s | gate=%s(m25=%.2f,m3=%.2f,tt_guard=%.2f,dyn=%s[k=%.2f])\n",
+    std::printf("Config: mode=%s limit=%lld | pairs=%d (%d games) | open=%d ply | endgame=%d empties | TT=%zu MiB | MPC=%s(t=%.2f,mode=%s,dyn_t=%s,cal=%s) | mgLMR=%s(m=%.1f) | mo=%s | gate=%s(m25=%.2f,m3=%.2f,tt_guard=%.2f,dyn=%s[k=%.2f])\n",
                 mode_str.c_str(), static_cast<long long>(limit_val), num_pairs, num_pairs * 2,
                 opening_plies, endgame_empties, tt_mb,
-                use_mpc ? "ON" : "OFF", mpc_t, mpc_cal_label.c_str(), mpc_pure_v64 ? "ON" : "OFF",
+                use_mpc ? "ON" : "OFF", mpc_t, mpc_mode_name(mpc_mode), mpc_dyn_t ? "ON" : "OFF",
+                mpc_cal_label.c_str(), use_mg_lmr ? "ON" : "OFF", mg_lmr_margin,
                 mo_label.c_str(), gate_mode_name(gate_mode), m25_discs, m3_discs, tt_guard_discs,
                 dyn_gate_mode_name(dyn_gate), dyn_r25_k);
 
@@ -383,7 +410,7 @@ int main(int argc, char** argv) {
         std::ofstream ofs(csv_path, std::ios::app);
         if (ofs) {
             if (!exists) {
-                ofs << "p1_mode,p2_mode,mode,limit,mpc,gate_mode,m25,m3,games,wins,draws,losses,win_rate,elo,elo_ci95,avg_disc_diff,p1_knps,p2_knps,p1_depth,p2_depth,p1_s25_pct,p1_s3_pct,p1_mpc_cut_pct,p2_mpc_cut_pct,mpc_pure_v64,tt_guard,mo_mode,mpc_cal,dyn_gate\n";
+                ofs << "p1_mode,p2_mode,mode,limit,mpc,gate_mode,m25,m3,games,wins,draws,losses,win_rate,elo,elo_ci95,avg_disc_diff,p1_knps,p2_knps,p1_depth,p2_depth,p1_s25_pct,p1_s3_pct,p1_mpc_cut_pct,p2_mpc_cut_pct,mpc_pure_v64,tt_guard,mo_mode,mpc_cal,dyn_gate,mpc_mode,mpc_dyn_t,mg_lmr\n";
             }
             ofs << eval_mode_name(m1.mode) << "," << eval_mode_name(m2.mode) << ","
                 << mode_str << "," << limit_val << "," << (use_mpc ? 1 : 0) << ","
@@ -393,7 +420,8 @@ int main(int argc, char** argv) {
                 << (nps1 * 1e-3) << "," << (nps2 * 1e-3) << "," << avg_d1 << "," << avg_d2 << ","
                 << p1_s25 << "," << p1_s3 << "," << p1_mpc << "," << p2_mpc << ","
                 << (mpc_pure_v64 ? 1 : 0) << "," << tt_guard_discs << "," << mo_label << ","
-                << mpc_cal_label << "," << dyn_gate_mode_name(dyn_gate) << "\n";
+                << mpc_cal_label << "," << dyn_gate_mode_name(dyn_gate) << ","
+                << mpc_mode_name(mpc_mode) << "," << (mpc_dyn_t ? 1 : 0) << "," << (use_mg_lmr ? 1 : 0) << "\n";
         }
     }
     return 0;

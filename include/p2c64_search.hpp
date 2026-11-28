@@ -130,7 +130,27 @@ static inline const char* dyn_gate_mode_name(DynGateMode dm) noexcept {
     return "off";
 }
 
-// Per-model calibrated Multi-ProbCut table (4 depth pairs x 60 plies = 2.88 KiB, L1D-resident!)
+enum class MpcMode : int {
+    LEGACY = 0,
+    CAL    = 1,
+    EG_D2  = 2
+};
+
+static inline const char* mpc_mode_name(MpcMode mm) noexcept {
+    switch (mm) {
+        case MpcMode::LEGACY: return "legacy";
+        case MpcMode::CAL:    return "cal";
+        case MpcMode::EG_D2:  return "eg_d2";
+    }
+    return "legacy";
+}
+
+// Egaroucid-style parity-matched shallow depth: d=3->1, 4->2, 5->3, 6->2, 7->3, 8->4, 9->5, 10->4
+static inline constexpr int mpc_eg_d2_shallow(int depth) noexcept {
+    return ((depth / 2) & ~1) + (depth & 1);
+}
+
+// Per-model calibrated Multi-ProbCut table (6 d-4 pairs + 8 eg_d2 pairs x 60 plies = 10.08 KiB, L1D-resident!)
 struct MpcCalEntry {
     float inv_slope       = 1.0f;   // 1.0f / clamp(slope, 0.85, 1.15)
     float intercept_units = 0.0f;   // intercept_discs * score_scale
@@ -138,8 +158,11 @@ struct MpcCalEntry {
 };
 
 struct MpcCalTable {
-    bool        loaded = false;
-    MpcCalEntry table[4][NUM_PLIES]{}; // index 0..3 -> d_shallow = 1..4 (d_deep = 5..8)
+    bool        loaded       = false;
+    bool        d4_loaded    = false;
+    bool        eg_d2_loaded = false;
+    MpcCalEntry table[6][NUM_PLIES]{};      // index 0..5 -> d_shallow = 1..6 (d_deep = 5..10)
+    MpcCalEntry pair_table[8][NUM_PLIES]{}; // index 0..7 -> eg_d2 d_deep = 3..10
 };
 
 enum class SearchLimitMode : int {
@@ -177,8 +200,12 @@ public:
     // Standard Multi-ProbCut, Move Ordering & WACA-G2 2-stage gating parameters (100% fair across models!)
     bool          use_mpc_        = false;
     double        mpc_t_          = 1.80;
+    MpcMode       mpc_mode_       = MpcMode::LEGACY;
+    bool          mpc_dyn_t_      = false; // Default OFF: endgame-proximity dynamic MPC t schedule
     bool          mpc_pure_v64_   = false; // Default OFF: fair gated WACA_G2 + TT write on MPC probes!
     MpcCalTable   mpc_cal_{};              // Optional model-specific calibrated MPC table (L1D-resident)
+    bool          use_mg_lmr_     = false; // Default OFF: eval-margin-gated LMR (D3_mgLMR_m4)
+    int32_t       mg_lmr_margin_units_ = 512; // 4.0 discs * 128
     MoveOrderMode mo_mode_        = MoveOrderMode::STATIC;
     GateMode      gate_mode_      = GateMode::SAFE_BND;
     DynGateMode   dyn_gate_mode_  = DynGateMode::OFF;
@@ -219,6 +246,20 @@ public:
     void set_mpc(bool enable, double t_val = 1.80) noexcept {
         use_mpc_ = enable;
         mpc_t_   = t_val;
+    }
+
+    void set_mpc_mode(MpcMode mm) noexcept {
+        mpc_mode_ = mm;
+    }
+
+    void set_mpc_dyn_t(bool enable) noexcept {
+        mpc_dyn_t_ = enable;
+    }
+
+    void set_mg_lmr(bool enable, double margin_discs = 4.0) noexcept {
+        use_mg_lmr_ = enable;
+        const double sc = static_cast<double>(model_->score_scale);
+        mg_lmr_margin_units_ = static_cast<int32_t>(margin_discs * sc + 0.5);
     }
 
     void set_mpc_pure_v64(bool enable) noexcept {
@@ -275,12 +316,17 @@ public:
     }
 
     void clear_mpc_calibration() noexcept {
-        mpc_cal_.loaded = false;
+        mpc_cal_.loaded       = false;
+        mpc_cal_.d4_loaded    = false;
+        mpc_cal_.eg_d2_loaded = false;
     }
 
     // Load per-model MPC calibration CSV:
     //   d_shallow,d_deep,ply_lo,ply_hi,ply_center,n,slope,intercept,sigma,r2
-    // Builds piecewise-linear interpolated 4 x 60 L1D lookup table (d_sh = 1..4).
+    // Supports:
+    //   - 4-pair legacy CSV (1,5)..(4,8) -> safely extrapolates d5->d9 (0.90x) and d6->d10 (0.85x)
+    //   - 6-pair CSV (1,5)..(6,10)       -> direct 6 x 60 table
+    //   - eg_d2 CSV (1,3),(2,4),(3,5),(2,6),(3,7),(4,8),(5,9),(4,10) -> direct 8 x 60 pair_table
     bool load_mpc_calibration(const std::string& csv_path, std::string* err_msg = nullptr) {
         auto fail = [&](const std::string& msg) -> bool {
             if (err_msg) *err_msg = msg;
@@ -295,7 +341,8 @@ public:
             double intercept;
             double sigma;
         };
-        std::vector<CalPt> pts[4];
+        std::vector<CalPt> pts_d4[6];
+        std::vector<CalPt> pts_eg[8]; // d_deep = 3..10
         std::string line;
         while (std::getline(ifs, line)) {
             if (line.empty()) continue;
@@ -306,8 +353,8 @@ public:
             while (std::getline(ss, tok, ',')) cols.push_back(tok);
             if (cols.size() < 9) continue;
 
-            const int d_sh = std::atoi(cols[0].c_str());
-            if (d_sh < 1 || d_sh > 4) continue;
+            const int d_sh     = std::atoi(cols[0].c_str());
+            const int d_dp     = std::atoi(cols[1].c_str());
             const double ply_c = std::atof(cols[4].c_str());
             const double slope = std::atof(cols[6].c_str());
             const double bias  = std::atof(cols[7].c_str());
@@ -315,15 +362,16 @@ public:
             if (!std::isfinite(ply_c) || !std::isfinite(slope) || !std::isfinite(bias) || !std::isfinite(sig)) {
                 continue;
             }
-            pts[d_sh - 1].push_back({ply_c, slope, bias, sig});
+            if (d_sh >= 1 && d_sh <= 6 && d_dp == d_sh + 4) {
+                pts_d4[d_sh - 1].push_back({ply_c, slope, bias, sig});
+            }
+            if (d_dp >= 3 && d_dp <= 10 && d_sh == mpc_eg_d2_shallow(d_dp)) {
+                pts_eg[d_dp - 3].push_back({ply_c, slope, bias, sig});
+            }
         }
 
         const double sc = static_cast<double>(model_->score_scale);
-        for (int d_idx = 0; d_idx < 4; ++d_idx) {
-            auto& vec = pts[d_idx];
-            if (vec.empty()) {
-                return fail("Missing calibration rows for d_shallow=" + std::to_string(d_idx + 1) + " in " + csv_path);
-            }
+        auto fill_row = [&](std::vector<CalPt>& vec, MpcCalEntry dst[NUM_PLIES]) {
             std::sort(vec.begin(), vec.end(), [](const CalPt& a, const CalPt& b) {
                 return a.ply_center < b.ply_center;
             });
@@ -354,12 +402,59 @@ public:
                 }
                 const double sl_c = std::clamp(sl, 0.85, 1.15);
                 const double sg_c = std::clamp(sg, 0.80, 6.00);
-                mpc_cal_.table[d_idx][p].inv_slope       = static_cast<float>(1.0 / sl_c);
-                mpc_cal_.table[d_idx][p].intercept_units = static_cast<float>(bi * sc);
-                mpc_cal_.table[d_idx][p].sigma_units     = static_cast<float>(sg_c * sc);
+                dst[p].inv_slope       = static_cast<float>(1.0 / sl_c);
+                dst[p].intercept_units = static_cast<float>(bi * sc);
+                dst[p].sigma_units     = static_cast<float>(sg_c * sc);
             }
+        };
+
+        bool has_d4_base = (!pts_d4[0].empty() && !pts_d4[1].empty() && !pts_d4[2].empty() && !pts_d4[3].empty());
+        bool has_eg_all  = true;
+        for (int i = 0; i < 8; ++i) {
+            if (pts_eg[i].empty()) { has_eg_all = false; break; }
         }
-        mpc_cal_.loaded = true;
+        if (!has_d4_base && !has_eg_all) {
+            return fail("Missing required MPC calibration rows (need d_sh=1..4 d-4 pairs or full eg_d2 pairs) in " + csv_path);
+        }
+
+        mpc_cal_.d4_loaded    = false;
+        mpc_cal_.eg_d2_loaded = false;
+
+        if (has_d4_base) {
+            for (int d_idx = 0; d_idx < 4; ++d_idx) {
+                fill_row(pts_d4[d_idx], mpc_cal_.table[d_idx]);
+            }
+            // d5->d9 (index 4): direct if present, else safe 0.90x sigma extrapolation from d4->d8
+            if (!pts_d4[4].empty()) {
+                fill_row(pts_d4[4], mpc_cal_.table[4]);
+            } else {
+                for (int p = 0; p < NUM_PLIES; ++p) {
+                    mpc_cal_.table[4][p] = mpc_cal_.table[3][p];
+                    mpc_cal_.table[4][p].sigma_units = static_cast<float>(
+                        std::max(0.80 * sc, static_cast<double>(mpc_cal_.table[3][p].sigma_units) * 0.90));
+                }
+            }
+            // d6->d10 (index 5): direct if present, else safe 0.85x sigma extrapolation from d4->d8
+            if (!pts_d4[5].empty()) {
+                fill_row(pts_d4[5], mpc_cal_.table[5]);
+            } else {
+                for (int p = 0; p < NUM_PLIES; ++p) {
+                    mpc_cal_.table[5][p] = mpc_cal_.table[3][p];
+                    mpc_cal_.table[5][p].sigma_units = static_cast<float>(
+                        std::max(0.80 * sc, static_cast<double>(mpc_cal_.table[3][p].sigma_units) * 0.85));
+                }
+            }
+            mpc_cal_.d4_loaded = true;
+        }
+
+        if (has_eg_all) {
+            for (int i = 0; i < 8; ++i) {
+                fill_row(pts_eg[i], mpc_cal_.pair_table[i]);
+            }
+            mpc_cal_.eg_d2_loaded = true;
+        }
+
+        mpc_cal_.loaded = (mpc_cal_.d4_loaded || mpc_cal_.eg_d2_loaded);
         return true;
     }
 
@@ -367,7 +462,9 @@ public:
         if (d_sh <= 1) return 2.65 + 0.030 * static_cast<double>(ply);
         if (d_sh == 2) return 2.15 + 0.035 * static_cast<double>(ply);
         if (d_sh == 3) return 1.95 + 0.032 * static_cast<double>(ply);
-        return 1.70 + 0.030 * static_cast<double>(ply);
+        if (d_sh == 4) return 1.70 + 0.030 * static_cast<double>(ply);
+        if (d_sh == 5) return 1.53 + 0.027 * static_cast<double>(ply);
+        return 1.44 + 0.025 * static_cast<double>(ply);
     }
 
     void allocate_tt(size_t tt_mb) {
@@ -584,23 +681,39 @@ public:
             }
         }
 
-        // Standard / Calibrated Multi-ProbCut (100% fair per-model Buro regression when mpc_cal_.loaded)
+        // Standard / Calibrated / Egaroucid-d2 Multi-ProbCut (100% fair across models!)
+        const int mpc_min_depth = (mpc_mode_ == MpcMode::EG_D2) ? 3 : 5;
+        const int rem_to_eg     = empties - endgame_empties_;
         if (use_mpc_ && !out_best_move && !in_mpc_probe &&
-            beta == alpha + 1 && depth >= 5 && empties > endgame_empties_ + 4) {
-            const int d_sh = depth - 4;
+            beta == alpha + 1 && depth >= mpc_min_depth && rem_to_eg > 4) {
+            double t_eff = mpc_t_;
+            if (mpc_dyn_t_) {
+                if (rem_to_eg <= 6)       t_eff = std::max(mpc_t_, 2.30);
+                else if (rem_to_eg <= 10) t_eff = std::max(mpc_t_, 1.80);
+            }
+
+            const int d_sh = (mpc_mode_ == MpcMode::EG_D2) ? mpc_eg_d2_shallow(depth) : (depth - 4);
+            const int cply = std::clamp(ply, 0, NUM_PLIES - 1);
             int32_t hi = 0;
             int32_t lo = 0;
-            if (mpc_cal_.loaded) {
-                const int d_idx = std::clamp(d_sh, 1, 4) - 1;
-                const int cply  = std::clamp(ply, 0, NUM_PLIES - 1);
-                const MpcCalEntry& cal = mpc_cal_.table[d_idx][cply];
-                const float delta = static_cast<float>(mpc_t_) * cal.sigma_units;
-                hi = static_cast<int32_t>(std::lround((static_cast<float>(beta)  - cal.intercept_units + delta) * cal.inv_slope));
-                lo = static_cast<int32_t>(std::lround((static_cast<float>(alpha) - cal.intercept_units - delta) * cal.inv_slope));
+
+            const MpcCalEntry* cal_ptr = nullptr;
+            if (mpc_mode_ == MpcMode::EG_D2 && mpc_cal_.eg_d2_loaded) {
+                const int eg_idx = std::clamp(depth - 3, 0, 7);
+                cal_ptr = &mpc_cal_.pair_table[eg_idx][cply];
+            } else if (mpc_cal_.d4_loaded) {
+                const int d_idx = std::clamp(d_sh, 1, 6) - 1;
+                cal_ptr = &mpc_cal_.table[d_idx][cply];
+            }
+
+            if (cal_ptr) {
+                const float delta = static_cast<float>(t_eff) * cal_ptr->sigma_units;
+                hi = static_cast<int32_t>(std::lround((static_cast<float>(beta)  - cal_ptr->intercept_units + delta) * cal_ptr->inv_slope));
+                lo = static_cast<int32_t>(std::lround((static_cast<float>(alpha) - cal_ptr->intercept_units - delta) * cal_ptr->inv_slope));
             } else {
                 const double sig = mpc_sigma_discs(d_sh, ply);
                 const int32_t bound_delta = static_cast<int32_t>(
-                    mpc_t_ * sig * static_cast<double>(model_->score_scale) + 0.5);
+                    t_eff * sig * static_cast<double>(model_->score_scale) + 0.5);
                 hi = beta + bound_delta;
                 lo = alpha - bound_delta;
             }
@@ -714,6 +827,12 @@ public:
         uint16_t child_idx[NUM_PATTERNS];
         const bool need_child_hash = !(depth == 1 && empties - 1 > endgame_empties_);
 
+        // D3_mgLMR_m4: lazy-cached static_eval computed at most once per eligible null-window node
+        const bool mg_lmr_eligible = (use_mg_lmr_ && !out_best_move && !in_mpc_probe &&
+                                      beta == alpha + 1 && depth >= 3 && n_moves > 3);
+        bool    has_static_eval = false;
+        int32_t static_eval     = 0;
+
         for (int i = 0; i < n_moves; ++i) {
             int best_idx = i;
             for (int j = i + 1; j < n_moves; ++j) {
@@ -761,11 +880,33 @@ public:
                     val = -pvs_midgame(nB, nW, -stm, ply + 1, depth - 1, nh, child_idx,
                                        -beta, -alpha, false, nullptr, in_mpc_probe);
                 } else {
-                    val = -pvs_midgame(nB, nW, -stm, ply + 1, depth - 1, nh, child_idx,
-                                       -alpha - 1, -alpha, false, nullptr, in_mpc_probe);
-                    if (!aborted_ && val > alpha && val < beta) {
+                    bool do_lmr = false;
+                    if (mg_lmr_eligible && i >= 3) {
+                        if (!has_static_eval) {
+                            const int cply = std::clamp(ply, 0, NUM_PLIES - 1);
+                            uint64_t tmp_s25 = 0, tmp_s3 = 0;
+                            static_eval = model_->evaluate_search(
+                                pt_.meta, idx, B, W, stm, ply, alpha, beta,
+                                false, gate_mode_, m25_ply_[cply], m3_ply_[cply],
+                                tmp_s25, tmp_s3, tt_guard_units_, dyn_r25_q4_);
+                            has_static_eval = true;
+                        }
+                        do_lmr = (static_eval + mg_lmr_margin_units_ < alpha);
+                    }
+                    if (do_lmr) {
+                        val = -pvs_midgame(nB, nW, -stm, ply + 1, depth - 2, nh, child_idx,
+                                           -alpha - 1, -alpha, false, nullptr, in_mpc_probe);
+                        if (!aborted_ && val > alpha) {
+                            val = -pvs_midgame(nB, nW, -stm, ply + 1, depth - 1, nh, child_idx,
+                                               -alpha - 1, -alpha, false, nullptr, in_mpc_probe);
+                        }
+                    } else {
                         val = -pvs_midgame(nB, nW, -stm, ply + 1, depth - 1, nh, child_idx,
-                                           -beta, -alpha, false, nullptr, in_mpc_probe);
+                                           -alpha - 1, -alpha, false, nullptr, in_mpc_probe);
+                        if (!aborted_ && val > alpha && val < beta) {
+                            val = -pvs_midgame(nB, nW, -stm, ply + 1, depth - 1, nh, child_idx,
+                                               -beta, -alpha, false, nullptr, in_mpc_probe);
+                        }
                     }
                 }
             }
@@ -920,8 +1061,9 @@ public:
         return res;
     }
 
-    // Fixed-depth score evaluation (used by MPC sigma measurer; tier1_only=true measures MPC-PureV64!)
-    int32_t eval_fixed_depth(uint64_t B, uint64_t W, int stm, int depth, bool tier1_only = false) {
+    // Fixed-depth score evaluation (used by MPC sigma measurer & relabel_dataset; tier1_only=true measures MPC-PureV64!)
+    int32_t eval_fixed_depth(uint64_t B, uint64_t W, int stm, int depth,
+                             bool tier1_only = false, bool allow_mpc = false) {
         const int discs = __builtin_popcountll(B | W);
         const int ply   = discs - 4;
         const uint64_t hash = zk_.hash_board(B, W, stm);
@@ -933,7 +1075,7 @@ public:
         nodes_ = 0; node_limit_ = 0; use_time_limit_ = false; aborted_ = false;
         const bool saved_mpc  = use_mpc_;
         const bool saved_pure = mpc_pure_v64_;
-        use_mpc_ = false;
+        if (!allow_mpc) use_mpc_ = false;
         if (tier1_only) mpc_pure_v64_ = true;
         int32_t sc = pvs_midgame(B, W, stm, ply, depth, hash, root_idx,
                                  -SEARCH_INF, SEARCH_INF, false, nullptr, tier1_only);

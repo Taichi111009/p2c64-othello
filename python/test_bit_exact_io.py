@@ -44,18 +44,21 @@ from p2c64_io import (
     WacaG2V31Model,
     WacaG2V32Model,
     WacaG2V33Model,
+    SwarV40Model,
     eval_p2c64_int_batch,
     eval_raw_ntuple64_int_batch,
     eval_waca_g2_int_batch,
     eval_waca_g2_v31_int_batch,
     eval_waca_g2_v32_int_batch,
     eval_waca_g2_v33_int_batch,
+    eval_swar_v40_int_batch,
     load_p2c,
     make_empty_p2c64,
     make_empty_waca_g2,
     make_empty_waca_g2_v31,
     make_empty_waca_g2_v32,
     make_empty_waca_g2_v33,
+    make_empty_swar_v40,
     raw_to_linear_p2c64,
     save_p2c64,
     save_raw_p2c,
@@ -63,12 +66,14 @@ from p2c64_io import (
     save_waca_g2_v31,
     save_waca_g2_v32,
     save_waca_g2_v33,
+    save_swar_v40,
     symmetrize_p2c64_model,
     symmetrize_raw_model,
     symmetrize_waca_g2_model,
     symmetrize_waca_g2_v31_model,
     symmetrize_waca_g2_v32_model,
     symmetrize_waca_g2_v33_model,
+    symmetrize_swar_v40_model,
 )
 
 
@@ -118,6 +123,29 @@ def verify_p2c_file(
     ply: np.ndarray,
 ) -> np.ndarray:
     model = load_p2c(p2c_path)
+    if isinstance(model, SwarV40Model):
+        ext = bridge.extract_batch_ptm(black, white, stm, enable_aug=False, need_p2c=False, need_raw=True)
+        py_sc = eval_swar_v40_int_batch(model, ext["raw_ptm"], ply)
+        cpp_mode, cpp_sc, max_sym_err = bridge.eval_swar_v40_file(
+            p2c_path, black, white, stm, ply, check_16sym=True
+        )
+        max_err = int(np.abs(py_sc.astype(np.int64) - cpp_sc.astype(np.int64)).max()) if len(black) else 0
+        non_zero = int(np.count_nonzero(cpp_sc))
+        tag = f"SWAR_V40({model.emb_ch}c/{model.num_blocks}b/L{model.local_relu})"
+        status = "PASS" if (max_err == 0 and max_sym_err == 0 and cpp_mode == int(EvalMode.SWAR_V40)) else "FAIL"
+        print(
+            f"[{status}] {p2c_path.name:<28} ({tag:<18} mode=10) | "
+            f"N={len(black)} | py_vs_cpp: max_err={max_err} | 16sym: max_err={max_sym_err} | "
+            f"non_zero={non_zero}/{len(black)}"
+        )
+        if max_err != 0 or max_sym_err != 0:
+            bad = np.where(py_sc != cpp_sc)[0]
+            if len(bad) > 0:
+                idx = int(bad[0])
+                print(f"       First mismatch at i={idx}: ply={ply[idx]} stm={stm[idx]} py={py_sc[idx]} cpp={cpp_sc[idx]}")
+            sys.exit(1)
+        return cpp_sc
+
     if isinstance(model, WacaG2V33Model):
         ext = bridge.extract_waca_g2_v33_batch(
             black, white, stm, ply, model.tier1_w, enable_aug=False, need_stage3=True
@@ -416,6 +444,23 @@ def run_synthetic_roundtrip(bridge: P2C64Bridge, tmp_dir: Path, black, white, st
             sys.exit(1)
         print(f"[PASS] synth RAW_NTUPLE_64 == WACA_G2_V33(H={h}).Stage1 bit-exact identity (max_err=0)")
 
+    # 7) SWAR_V40 v4.0 (4ch/8ch x 2/30-blk x local_relu=0/1) bit-exact check
+    for ch, blks, loc in ((4, 2, 0), (4, 30, 1), (8, 2, 0), (8, 30, 0), (8, 30, 1)):
+        sw = make_empty_swar_v40(emb_ch=ch, num_blocks=blks, local_relu=loc)
+        sw.tier1_w = raw.w_ply.copy()
+        sw.h_emb = rng.integers(-127, 128, size=(blks, KEY_RAW_ENTRIES, ch), dtype=np.int8)
+        sw.mu_g = rng.integers(-256, 257, size=(NUM_PLIES, 8), dtype=np.int16)
+        sw.mu_e = rng.integers(-256, 257, size=(NUM_PLIES, 4), dtype=np.int16)
+        sw.mu_d = rng.integers(-256, 257, size=(NUM_PLIES, 4), dtype=np.int16)
+        sw.beta_g = rng.integers(-300, 301, size=(NUM_PLIES, 12), dtype=np.int16)
+        sw.beta_e = rng.integers(-200, 201, size=(NUM_PLIES, 4), dtype=np.int16)
+        sw.beta_d = rng.integers(-200, 201, size=(NUM_PLIES, 4), dtype=np.int16)
+        sw.b_ply = rng.integers(-256, 257, size=(NUM_PLIES,), dtype=np.int32)
+        symmetrize_swar_v40_model(sw, bridge)
+        sp = tmp_dir / f"synth_swar_v40_{ch}c_{blks}b_l{loc}.p2c"
+        save_swar_v40(sp, sw)
+        verify_p2c_file(bridge, sp, black, white, stm, ply)
+
 
 def bench_bridge(bridge: P2C64Bridge, black, white, stm) -> None:
     reps = max(1, 100000 // len(black))
@@ -432,7 +477,7 @@ def bench_bridge(bridge: P2C64Bridge, black, white, stm) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Verify C++/Python bit-exact .p2c v2.0/v3.0/v3.1/v3.2/v3.3 I/O & 16-symmetry invariance")
+    ap = argparse.ArgumentParser(description="Verify C++/Python bit-exact .p2c v2.0/v3.0/v3.1/v3.2/v3.3/v4.0 I/O & 16-symmetry invariance")
     ap.add_argument("--data", type=Path, default=None)
     ap.add_argument("--num-pos", type=int, default=1000)
     ap.add_argument("--models", type=Path, nargs="*", default=None)
@@ -444,13 +489,14 @@ def main() -> None:
     bridge = P2C64Bridge()
     black, white, stm, ply = load_positions(args.data, args.num_pos)
 
-    print(f"=== P2C-64 v3.3 C++/Python Bit-Exact I/O & 16-Symmetry Test ({len(black)} positions) ===")
+    print(f"=== P2C-64 v4.0 (6 Generations) C++/Python Bit-Exact I/O & 16-Symmetry Test ({len(black)} positions) ===")
     files: List[Path] = []
     if args.models:
         files.extend(args.models)
     if args.work_dir:
         for name in (
             "raw_ntuple64.p2c",
+            "raw_ntuple64_relabel.p2c",
             "linear64.p2c",
             "cand_a_ptm_screlu4.p2c",
             "cand_b_ptm_3w3b.p2c",
@@ -461,6 +507,8 @@ def main() -> None:
             "waca_g2_v32.p2c",
             "waca_g2_v32_h24.p2c",
             "waca_g2_v33.p2c",
+            "swar_v40_8ch_30blk.p2c",
+            "swar_v40_4ch_30blk_loc.p2c",
         ):
             p = args.work_dir / name
             if p.exists():

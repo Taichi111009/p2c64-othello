@@ -31,21 +31,23 @@ static constexpr char     P2C_MAGIC_V32[8]       = {'P','2','C','6','4','V','3',
 static constexpr uint32_t P2C_FORMAT_VERSION_V32 = 5U;
 static constexpr char     P2C_MAGIC_V33[8]       = {'P','2','C','6','4','V','3','3'};
 static constexpr uint32_t P2C_FORMAT_VERSION_V33 = 6U;
+static constexpr char     P2C_MAGIC_V40[8]       = {'P','2','C','6','4','V','4','0'};
+static constexpr uint32_t P2C_FORMAT_VERSION_V40 = 7U;
 static constexpr float    P2C_DEFAULT_SCALE      = 128.0f;
 
 #pragma pack(push, 1)
 struct P2CFileHeader {
     char     magic[8];
-    uint32_t version;            // 2 (v2.0), 3 (v3.0), 4 (v3.1), 5 (v3.2), or 6 (v3.3 WACA_G2_V33)
-    uint32_t eval_mode;          // EvalMode enum value [0..9]
+    uint32_t version;            // 2..6 (v2.0..v3.3), or 7 (v4.0 SWAR_V40)
+    uint32_t eval_mode;          // EvalMode enum value [0..10]
     float    score_scale;        // Integer eval units per 1.0 disc
     uint32_t flags;              // Bit 0 = D4 symmetrized
     uint32_t key_raw_entries;    // 91,854
     uint32_t nonkey_raw_entries; // 318,168
     uint32_t total_raw_entries;  // 410,022
     uint32_t num_plies;          // 60
-    uint32_t num_blocks;         // 10 (v2.0), 20 (v3.0 EO), or 30 (v3.1/v3.2/v3.3 EO)
-    uint32_t reserved;           // 0 (v2.0) or mlp_hidden (v3.0/v3.1/v3.2/v3.3: 16 or 24)
+    uint32_t num_blocks;         // 10 (v2.0), 20 (v3.0), 30 (v3.1-3.3), or 2/30 (v4.0)
+    uint32_t reserved;           // 0 (v2.0), mlp_hidden (v3.x), or (emb_ch | (local_relu<<8)) (v4.0)
     uint64_t payload_bytes;      // Exact payload length in bytes
     uint64_t checksum_fnv1a;     // 64-bit FNV-1a checksum of payload bytes
 };
@@ -77,6 +79,7 @@ static inline const char* eval_mode_name(EvalMode mode) noexcept {
         case EvalMode::WACA_G2_V31:           return "WACA_G2_V31";
         case EvalMode::WACA_G2_V32:           return "WACA_G2_V32";
         case EvalMode::WACA_G2_V33:           return "WACA_G2_V33";
+        case EvalMode::SWAR_V40:              return "SWAR_V40";
     }
     return "UNKNOWN";
 }
@@ -91,11 +94,13 @@ struct LoadedModel {
     std::unique_ptr<WacaG2V31Weights> waca_v31;
     std::unique_ptr<WacaG2V32Weights> waca_v32;
     std::unique_ptr<WacaG2V33Weights> waca_v33;
+    std::unique_ptr<SwarV40Weights>   swar_v40;
     bool                              is_raw      = false;
     bool                              is_waca     = false;
     bool                              is_waca_v31 = false;
     bool                              is_waca_v32 = false;
     bool                              is_waca_v33 = false;
+    bool                              is_swar_v40 = false;
 
     inline bool is_any_waca() const noexcept { return is_waca || is_waca_v31 || is_waca_v32 || is_waca_v33; }
 
@@ -123,6 +128,8 @@ struct LoadedModel {
                 return eval_raw_ntuple64(waca_v32->tier1, meta, idx, stm, ply);
             case EvalMode::WACA_G2_V33:
                 return eval_raw_ntuple64(waca_v33->tier1, meta, idx, stm, ply);
+            case EvalMode::SWAR_V40:
+                return eval_swar_v40(*swar_v40, meta, idx, stm, ply);
         }
         return 0;
     }
@@ -149,6 +156,9 @@ struct LoadedModel {
     inline int32_t evaluate_tier1_only(const PatternMeta* __restrict meta,
                                        const uint16_t* __restrict idx,
                                        int stm, int ply) const noexcept {
+        if (is_swar_v40) {
+            return eval_raw_ntuple64(swar_v40->tier1, meta, idx, stm, ply);
+        }
         if (is_waca_v33) {
             return eval_raw_ntuple64(waca_v33->tier1, meta, idx, stm, ply);
         }
@@ -529,6 +539,67 @@ inline bool save_waca_g2_v33_p2c(const std::string& path,
     return static_cast<bool>(ofs);
 }
 
+inline bool save_swar_v40(const std::string& path,
+                          const SwarV40Weights& w,
+                          float score_scale = P2C_DEFAULT_SCALE,
+                          uint32_t flags = 1U) {
+    if ((w.emb_ch != 4 && w.emb_ch != 8) || (w.num_blocks != 2 && w.num_blocks != 30) ||
+        (w.local_relu != 0 && w.local_relu != 1)) {
+        return false;
+    }
+    const auto& pt = get_pattern_tables();
+    const size_t t1_bytes  = static_cast<size_t>(pt.total_raw_entries) * sizeof(int16_t);
+    const size_t emb_elems = static_cast<size_t>(w.num_blocks) * static_cast<size_t>(pt.key_raw_entries) * static_cast<size_t>(w.emb_ch);
+    const size_t head_bytes_per_ply = 8 * sizeof(int16_t) + 4 * sizeof(int16_t) + 4 * sizeof(int16_t)
+                                    + 12 * sizeof(int16_t) + 4 * sizeof(int16_t) + 4 * sizeof(int16_t)
+                                    + sizeof(int32_t); // 76 bytes/ply
+    std::vector<int8_t> emb_i8(emb_elems);
+    w.unpack_to_i8(emb_i8.data());
+
+    std::vector<uint8_t> payload;
+    payload.reserve(NUM_PLIES * t1_bytes + emb_elems + NUM_PLIES * head_bytes_per_ply);
+    auto append = [&](const void* src, size_t n) {
+        const uint8_t* p = static_cast<const uint8_t*>(src);
+        payload.insert(payload.end(), p, p + n);
+    };
+
+    for (int ply = 0; ply < NUM_PLIES; ++ply) {
+        append(w.tier1.w_ply[ply].data(), t1_bytes);
+    }
+    append(emb_i8.data(), emb_elems);
+    for (int ply = 0; ply < NUM_PLIES; ++ply) {
+        append(w.head[ply].mu_g,   8 * sizeof(int16_t));
+        append(w.head[ply].mu_e,   4 * sizeof(int16_t));
+        append(w.head[ply].mu_d,   4 * sizeof(int16_t));
+        append(w.head[ply].beta_g, 12 * sizeof(int16_t));
+        append(w.head[ply].beta_e, 4 * sizeof(int16_t));
+        append(w.head[ply].beta_d, 4 * sizeof(int16_t));
+        append(&w.head[ply].b_ply, sizeof(int32_t));
+    }
+
+    P2CFileHeader hdr{};
+    std::memcpy(hdr.magic, P2C_MAGIC_V40, 8);
+    hdr.version            = P2C_FORMAT_VERSION_V40;
+    hdr.eval_mode          = static_cast<uint32_t>(EvalMode::SWAR_V40);
+    hdr.score_scale        = score_scale;
+    hdr.flags              = flags;
+    hdr.key_raw_entries    = static_cast<uint32_t>(pt.key_raw_entries);
+    hdr.nonkey_raw_entries = static_cast<uint32_t>(pt.nonkey_raw_entries);
+    hdr.total_raw_entries  = static_cast<uint32_t>(pt.total_raw_entries);
+    hdr.num_plies          = static_cast<uint32_t>(NUM_PLIES);
+    hdr.num_blocks         = static_cast<uint32_t>(w.num_blocks);
+    hdr.reserved           = (static_cast<uint32_t>(w.emb_ch) & 0xFFU)
+                           | ((static_cast<uint32_t>(w.local_relu) & 0xFFU) << 8);
+    hdr.payload_bytes      = static_cast<uint64_t>(payload.size());
+    hdr.checksum_fnv1a     = fnv1a_64_update(fnv1a_64_init(), payload.data(), payload.size());
+
+    std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
+    if (!ofs) return false;
+    ofs.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+    ofs.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+    return static_cast<bool>(ofs);
+}
+
 inline bool load_p2c_model(const std::string& path, LoadedModel& out, std::string* err_msg = nullptr) {
     auto fail = [&](const std::string& msg) -> bool {
         if (err_msg) *err_msg = msg;
@@ -547,8 +618,9 @@ inline bool load_p2c_model(const std::string& path, LoadedModel& out, std::strin
     const bool is_v31 = (std::memcmp(hdr.magic, P2C_MAGIC_V31, 8) == 0 && hdr.version == P2C_FORMAT_VERSION_V31);
     const bool is_v32 = (std::memcmp(hdr.magic, P2C_MAGIC_V32, 8) == 0 && hdr.version == P2C_FORMAT_VERSION_V32);
     const bool is_v33 = (std::memcmp(hdr.magic, P2C_MAGIC_V33, 8) == 0 && hdr.version == P2C_FORMAT_VERSION_V33);
-    if (!is_v2 && !is_v3 && !is_v31 && !is_v32 && !is_v33) {
-        return fail("Invalid magic/version (expected P2C64V20 v2, P2C64V30 v3, P2C64V31 v4, P2C64V32 v5, or P2C64V33 v6) in: " + path);
+    const bool is_v40 = (std::memcmp(hdr.magic, P2C_MAGIC_V40, 8) == 0 && hdr.version == P2C_FORMAT_VERSION_V40);
+    if (!is_v2 && !is_v3 && !is_v31 && !is_v32 && !is_v33 && !is_v40) {
+        return fail("Invalid magic/version (expected P2C64V20..V33 or P2C64V40 v7) in: " + path);
     }
 
     const auto& pt = get_pattern_tables();
@@ -596,7 +668,7 @@ inline bool load_p2c_model(const std::string& path, LoadedModel& out, std::strin
         if (hdr.reserved < 1U || hdr.reserved > static_cast<uint32_t>(WACA_V32_MAX_HID)) {
             return fail("Invalid v3.2 mlp_hidden in header (expected 1..24)");
         }
-    } else {
+    } else if (is_v33) {
         if (hdr.eval_mode != static_cast<uint32_t>(EvalMode::WACA_G2_V33)) {
             return fail("Invalid v3.3 eval_mode in header (expected WACA_G2_V33=9)");
         }
@@ -605,6 +677,18 @@ inline bool load_p2c_model(const std::string& path, LoadedModel& out, std::strin
         }
         if (hdr.reserved < 1U || hdr.reserved > static_cast<uint32_t>(WACA_V33_MAX_HID)) {
             return fail("Invalid v3.3 mlp_hidden in header (expected 1..24)");
+        }
+    } else {
+        if (hdr.eval_mode != static_cast<uint32_t>(EvalMode::SWAR_V40)) {
+            return fail("Invalid v4.0 eval_mode in header (expected SWAR_V40=10)");
+        }
+        if (hdr.num_blocks != 2U && hdr.num_blocks != 30U) {
+            return fail("Header num_blocks mismatch P2C-64 v4.0 spec (expected 2 or 30)");
+        }
+        const uint32_t emb_ch = hdr.reserved & 0xFFU;
+        const uint32_t loc    = (hdr.reserved >> 8) & 0xFFU;
+        if ((emb_ch != 4U && emb_ch != 8U) || (loc != 0U && loc != 1U)) {
+            return fail("Invalid v4.0 emb_ch/local_relu in header");
         }
     }
 
@@ -625,6 +709,7 @@ inline bool load_p2c_model(const std::string& path, LoadedModel& out, std::strin
     out.is_waca_v31 = (out.mode == EvalMode::WACA_G2_V31);
     out.is_waca_v32 = (out.mode == EvalMode::WACA_G2_V32);
     out.is_waca_v33 = (out.mode == EvalMode::WACA_G2_V33);
+    out.is_swar_v40 = (out.mode == EvalMode::SWAR_V40);
 
     size_t off = 0;
     auto read_chunk = [&](void* dst, size_t n) -> bool {
@@ -639,6 +724,30 @@ inline bool load_p2c_model(const std::string& path, LoadedModel& out, std::strin
         for (int ply = 0; ply < NUM_PLIES; ++ply) {
             if (!read_chunk(out.raw.w_ply[ply].data(), w_bytes)) return fail("RAW w_ply read error");
         }
+    } else if (out.is_swar_v40) {
+        const int emb_ch = static_cast<int>(hdr.reserved & 0xFFU);
+        const int loc    = static_cast<int>((hdr.reserved >> 8) & 0xFFU);
+        const int n_blks = static_cast<int>(hdr.num_blocks);
+        out.swar_v40 = std::make_unique<SwarV40Weights>(emb_ch, n_blks, loc);
+        auto& sw = *out.swar_v40;
+        const size_t t1_bytes  = static_cast<size_t>(pt.total_raw_entries) * sizeof(int16_t);
+        const size_t emb_elems = static_cast<size_t>(n_blks) * static_cast<size_t>(pt.key_raw_entries) * static_cast<size_t>(emb_ch);
+        for (int ply = 0; ply < NUM_PLIES; ++ply) {
+            if (!read_chunk(sw.tier1.w_ply[ply].data(), t1_bytes)) return fail("SWAR v4.0 tier1 read error");
+        }
+        std::vector<int8_t> emb_i8(emb_elems);
+        if (!read_chunk(emb_i8.data(), emb_elems)) return fail("SWAR v4.0 h_emb read error");
+        sw.pack_from_i8(emb_i8.data());
+        for (int ply = 0; ply < NUM_PLIES; ++ply) {
+            if (!read_chunk(sw.head[ply].mu_g,   8 * sizeof(int16_t))) return fail("SWAR v4.0 mu_g read error");
+            if (!read_chunk(sw.head[ply].mu_e,   4 * sizeof(int16_t))) return fail("SWAR v4.0 mu_e read error");
+            if (!read_chunk(sw.head[ply].mu_d,   4 * sizeof(int16_t))) return fail("SWAR v4.0 mu_d read error");
+            if (!read_chunk(sw.head[ply].beta_g, 12 * sizeof(int16_t))) return fail("SWAR v4.0 beta_g read error");
+            if (!read_chunk(sw.head[ply].beta_e, 4 * sizeof(int16_t))) return fail("SWAR v4.0 beta_e read error");
+            if (!read_chunk(sw.head[ply].beta_d, 4 * sizeof(int16_t))) return fail("SWAR v4.0 beta_d read error");
+            if (!read_chunk(&sw.head[ply].b_ply, sizeof(int32_t))) return fail("SWAR v4.0 b_ply read error");
+        }
+        sw.prepare_all_heads();
     } else if (out.is_waca_v33) {
         out.waca_v33 = std::make_unique<WacaG2V33Weights>();
         auto& wv = *out.waca_v33;

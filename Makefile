@@ -11,6 +11,7 @@ PREP_BIN     := $(BUILD_DIR)/preprocess_egaroucid
 BRIDGE_SO    := $(BUILD_DIR)/libp2c64_batch.so
 MATCH_BIN    := $(BUILD_DIR)/match_engine
 MPC_BIN      := $(BUILD_DIR)/measure_mpc_sigma
+RELABEL_BIN  := $(BUILD_DIR)/relabel_dataset
 
 HEADERS      := include/p2c64_patterns.hpp include/p2c64_eval.hpp \
                 include/p2c64_data.hpp include/p2c64_io.hpp include/p2c64_search.hpp
@@ -19,12 +20,12 @@ HEADERS      := include/p2c64_patterns.hpp include/p2c64_eval.hpp \
 
 all: $(TEST_BIN) $(BENCH_BIN) tools
 
-tools: $(PREP_BIN) $(BRIDGE_SO) $(MATCH_BIN) $(MPC_BIN)
+tools: $(PREP_BIN) $(BRIDGE_SO) $(MATCH_BIN) $(MPC_BIN) $(RELABEL_BIN)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-$(TEST_BIN): tests/test_symmetry_and_safety.cpp include/p2c64_patterns.hpp include/p2c64_eval.hpp | $(BUILD_DIR)
+$(TEST_BIN): tests/test_symmetry_and_safety.cpp $(HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 $(BENCH_BIN): bench/bench_scalar_eval.cpp include/p2c64_patterns.hpp include/p2c64_eval.hpp | $(BUILD_DIR)
@@ -41,6 +42,9 @@ $(MATCH_BIN): tools/match_engine.cpp $(HEADERS) | $(BUILD_DIR)
 
 $(MPC_BIN): tools/measure_mpc_sigma.cpp $(HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $< -o $@
+
+$(RELABEL_BIN): tools/relabel_dataset.cpp $(HEADERS) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -fopenmp $< -o $@
 
 test: $(TEST_BIN)
 	./$(TEST_BIN)

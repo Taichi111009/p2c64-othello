@@ -37,6 +37,8 @@ P2C_MAGIC_V32 = b"P2C64V32"
 P2C_FORMAT_VERSION_V32 = 5
 P2C_MAGIC_V33 = b"P2C64V33"
 P2C_FORMAT_VERSION_V33 = 6
+P2C_MAGIC_V40 = b"P2C64V40"
+P2C_FORMAT_VERSION_V40 = 7
 P2C_DEFAULT_SCALE = 128.0
 HEADER_STRUCT = struct.Struct("<8sIIfIIIIIIIQQ")
 assert HEADER_STRUCT.size == 64
@@ -89,6 +91,12 @@ WACA_V33_CTR_RAW_ENTRIES = 19683
 WACA_V33_SCRELU_TERMS = 44
 WACA_V33_SCRELU_BETA_MAX = 1023
 
+# SWAR_V40 v4.0 fixed-point constants
+SWAR_V40_C = 2048
+SWAR_V40_H_MAX = 127
+SWAR_V40_MU_MAX = 256
+SWAR_V40_BETA_MAX = SCRELU_BETA_MAX
+
 BLOCK_ENTRY_DTYPE = np.dtype([("w", "<i2", (6,)), ("aux", "u1", (4,))], align=False)
 assert BLOCK_ENTRY_DTYPE.itemsize == 16
 
@@ -104,6 +112,7 @@ class EvalMode(IntEnum):
     WACA_G2_V31 = 7
     WACA_G2_V32 = 8
     WACA_G2_V33 = 9
+    SWAR_V40 = 10
 
 
 _DEFAULT_BRIDGE: Optional[P2C64Bridge] = None
@@ -873,7 +882,117 @@ def save_waca_g2_v33(path: str | Path, model: WacaG2V33Model) -> None:
         f.write(payload)
 
 
-def load_p2c(path: str | Path) -> RawNTupleModel | P2C64Model | WacaG2Model | WacaG2V31Model | WacaG2V32Model | WacaG2V33Model:
+@dataclass
+class SwarV40Model:
+    tier1_w: np.ndarray     # [60, 410022] int16
+    h_emb: np.ndarray       # [num_blocks, 91854, emb_ch] int8
+    mu_g: np.ndarray        # [60, 8] int16
+    mu_e: np.ndarray        # [60, 4] int16
+    mu_d: np.ndarray        # [60, 4] int16
+    beta_g: np.ndarray      # [60, 12] int16
+    beta_e: np.ndarray      # [60, 4] int16
+    beta_d: np.ndarray      # [60, 4] int16
+    b_ply: np.ndarray       # [60] int32
+    emb_ch: int = 8
+    num_blocks: int = 30
+    local_relu: int = 0
+    score_scale: float = P2C_DEFAULT_SCALE
+    flags: int = 1
+
+
+def make_empty_swar_v40(
+    emb_ch: int = 8,
+    num_blocks: int = 30,
+    local_relu: int = 0,
+    score_scale: float = P2C_DEFAULT_SCALE,
+) -> SwarV40Model:
+    if emb_ch not in (4, 8):
+        raise ValueError(f"emb_ch must be 4 or 8, got {emb_ch}")
+    if num_blocks not in (2, 30):
+        raise ValueError(f"num_blocks must be 2 or 30, got {num_blocks}")
+    if local_relu not in (0, 1):
+        raise ValueError(f"local_relu must be 0 or 1, got {local_relu}")
+    return SwarV40Model(
+        tier1_w=np.zeros((NUM_PLIES, TOTAL_RAW_ENTRIES), dtype=np.int16),
+        h_emb=np.zeros((num_blocks, KEY_RAW_ENTRIES, emb_ch), dtype=np.int8),
+        mu_g=np.zeros((NUM_PLIES, 8), dtype=np.int16),
+        mu_e=np.zeros((NUM_PLIES, 4), dtype=np.int16),
+        mu_d=np.zeros((NUM_PLIES, 4), dtype=np.int16),
+        beta_g=np.zeros((NUM_PLIES, 12), dtype=np.int16),
+        beta_e=np.zeros((NUM_PLIES, 4), dtype=np.int16),
+        beta_d=np.zeros((NUM_PLIES, 4), dtype=np.int16),
+        b_ply=np.zeros((NUM_PLIES,), dtype=np.int32),
+        emb_ch=emb_ch,
+        num_blocks=num_blocks,
+        local_relu=local_relu,
+        score_scale=score_scale,
+        flags=1,
+    )
+
+
+def symmetrize_swar_v40_model(model: SwarV40Model, bridge: Optional[P2C64Bridge] = None) -> None:
+    """In-place D4 internal mirror symmetrization for Tier-1 and SWAR Key-14 embeddings."""
+    br = bridge if bridge is not None else _get_default_bridge()
+    orbs = br.get_orbit_tables()
+    raw_rep = orbs["raw_orb_rep"]
+    key_rep = orbs["key_orb_rep"]
+    for ply in range(NUM_PLIES):
+        model.tier1_w[ply] = model.tier1_w[ply][raw_rep]
+    for b in range(model.num_blocks):
+        model.h_emb[b] = model.h_emb[b][key_rep]
+    model.flags |= 1
+
+
+def save_swar_v40(path: str | Path, model: SwarV40Model) -> None:
+    if model.emb_ch not in (4, 8):
+        raise ValueError(f"emb_ch must be 4 or 8, got {model.emb_ch}")
+    if model.num_blocks not in (2, 30):
+        raise ValueError(f"num_blocks must be 2 or 30, got {model.num_blocks}")
+    if model.local_relu not in (0, 1):
+        raise ValueError(f"local_relu must be 0 or 1, got {model.local_relu}")
+
+    t1 = np.ascontiguousarray(model.tier1_w, dtype="<i2")
+    h_emb = np.ascontiguousarray(model.h_emb, dtype="i1")
+    assert t1.shape == (NUM_PLIES, TOTAL_RAW_ENTRIES)
+    assert h_emb.shape == (model.num_blocks, KEY_RAW_ENTRIES, model.emb_ch)
+
+    head_chunks = []
+    for ply in range(NUM_PLIES):
+        head_chunks.append(np.ascontiguousarray(model.mu_g[ply], dtype="<i2").tobytes())
+        head_chunks.append(np.ascontiguousarray(model.mu_e[ply], dtype="<i2").tobytes())
+        head_chunks.append(np.ascontiguousarray(model.mu_d[ply], dtype="<i2").tobytes())
+        head_chunks.append(np.ascontiguousarray(model.beta_g[ply], dtype="<i2").tobytes())
+        head_chunks.append(np.ascontiguousarray(model.beta_e[ply], dtype="<i2").tobytes())
+        head_chunks.append(np.ascontiguousarray(model.beta_d[ply], dtype="<i2").tobytes())
+        head_chunks.append(np.ascontiguousarray(model.b_ply[ply : ply + 1], dtype="<i4").tobytes())
+
+    payload = t1.tobytes() + h_emb.tobytes() + b"".join(head_chunks)
+    chk = _fast_fnv1a_64(payload)
+    reserved = (int(model.emb_ch) & 0xFF) | ((int(model.local_relu) & 0xFF) << 8)
+    hdr = HEADER_STRUCT.pack(
+        P2C_MAGIC_V40,
+        P2C_FORMAT_VERSION_V40,
+        int(EvalMode.SWAR_V40),
+        float(model.score_scale),
+        int(model.flags),
+        KEY_RAW_ENTRIES,
+        NONKEY_RAW_ENTRIES,
+        TOTAL_RAW_ENTRIES,
+        NUM_PLIES,
+        int(model.num_blocks),
+        reserved,
+        len(payload),
+        chk,
+    )
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(hdr)
+        f.write(payload)
+
+
+def load_p2c(
+    path: str | Path,
+) -> RawNTupleModel | P2C64Model | WacaG2Model | WacaG2V31Model | WacaG2V32Model | WacaG2V33Model | SwarV40Model:
     with open(path, "rb") as f:
         hdr_bytes = f.read(HEADER_STRUCT.size)
         if len(hdr_bytes) != HEADER_STRUCT.size:
@@ -887,7 +1006,8 @@ def load_p2c(path: str | Path) -> RawNTupleModel | P2C64Model | WacaG2Model | Wa
         is_v31 = (magic == P2C_MAGIC_V31 and version == P2C_FORMAT_VERSION_V31)
         is_v32 = (magic == P2C_MAGIC_V32 and version == P2C_FORMAT_VERSION_V32)
         is_v33 = (magic == P2C_MAGIC_V33 and version == P2C_FORMAT_VERSION_V33)
-        if not (is_v2 or is_v3 or is_v31 or is_v32 or is_v33):
+        is_v40 = (magic == P2C_MAGIC_V40 and version == P2C_FORMAT_VERSION_V40)
+        if not (is_v2 or is_v3 or is_v31 or is_v32 or is_v33 or is_v40):
             raise ValueError(f"Invalid .p2c magic/version in {path} (got {magic!r}, v={version})")
         if (kre, nre, tre, n_plies) != (KEY_RAW_ENTRIES, NONKEY_RAW_ENTRIES, TOTAL_RAW_ENTRIES, NUM_PLIES):
             raise ValueError("Table dimension mismatch in .p2c header")
@@ -906,6 +1026,53 @@ def load_p2c(path: str | Path) -> RawNTupleModel | P2C64Model | WacaG2Model | Wa
         chunk = mv[off : off + nbytes]
         off += nbytes
         return chunk
+
+    if is_v40:
+        emb_ch = int(res & 0xFF)
+        local_relu = int((res >> 8) & 0xFF)
+        if mode != EvalMode.SWAR_V40 or n_blks not in (2, 30) or emb_ch not in (4, 8) or local_relu not in (0, 1):
+            raise ValueError(
+                f"Invalid v4.0 header fields (mode={mode}, num_blocks={n_blks}, emb_ch={emb_ch}, local_relu={local_relu})"
+            )
+        t1 = np.frombuffer(take(NUM_PLIES * TOTAL_RAW_ENTRIES * 2), dtype="<i2").reshape(
+            NUM_PLIES, TOTAL_RAW_ENTRIES
+        ).copy()
+        h_emb = np.frombuffer(take(n_blks * KEY_RAW_ENTRIES * emb_ch), dtype="i1").reshape(
+            n_blks, KEY_RAW_ENTRIES, emb_ch
+        ).copy()
+        mu_g = np.zeros((NUM_PLIES, 8), dtype=np.int16)
+        mu_e = np.zeros((NUM_PLIES, 4), dtype=np.int16)
+        mu_d = np.zeros((NUM_PLIES, 4), dtype=np.int16)
+        beta_g = np.zeros((NUM_PLIES, 12), dtype=np.int16)
+        beta_e = np.zeros((NUM_PLIES, 4), dtype=np.int16)
+        beta_d = np.zeros((NUM_PLIES, 4), dtype=np.int16)
+        b_ply = np.zeros((NUM_PLIES,), dtype=np.int32)
+        for ply in range(NUM_PLIES):
+            mu_g[ply] = np.frombuffer(take(16), dtype="<i2")
+            mu_e[ply] = np.frombuffer(take(8), dtype="<i2")
+            mu_d[ply] = np.frombuffer(take(8), dtype="<i2")
+            beta_g[ply] = np.frombuffer(take(24), dtype="<i2")
+            beta_e[ply] = np.frombuffer(take(8), dtype="<i2")
+            beta_d[ply] = np.frombuffer(take(8), dtype="<i2")
+            b_ply[ply] = int(np.frombuffer(take(4), dtype="<i4")[0])
+        if off != len(payload):
+            raise ValueError("Unread trailing bytes in v4.0 .p2c payload")
+        return SwarV40Model(
+            tier1_w=t1,
+            h_emb=h_emb,
+            mu_g=mu_g,
+            mu_e=mu_e,
+            mu_d=mu_d,
+            beta_g=beta_g,
+            beta_e=beta_e,
+            beta_d=beta_d,
+            b_ply=b_ply,
+            emb_ch=emb_ch,
+            num_blocks=n_blks,
+            local_relu=local_relu,
+            score_scale=scale,
+            flags=flags,
+        )
 
     if is_v33:
         if mode != EvalMode.WACA_G2_V33 or n_blks != WACA_V33_EO_BLOCKS:
@@ -1507,3 +1674,55 @@ def eval_waca_g2_v33_int_batch(
     rt = np.clip(r25 + r_mlp + r_key, -WACA_MAX_RES, WACA_MAX_RES).astype(np.int32)
     v3 = (v1_i + rt).astype(np.int32)
     return v1_i, v25, v3
+
+
+def eval_swar_v40_int_batch(
+    model: SwarV40Model,
+    raw_ptm: np.ndarray,  # [N, 64] int32 PTM flat indices
+    ply: np.ndarray,      # [N] uint8
+) -> np.ndarray:
+    """Bit-exact Python integer simulator matching C++ eval_swar_v40 across all (ch, blocks, local_relu)."""
+    ply_i = ply.astype(np.int32)
+    n = len(ply_i)
+    v1 = model.tier1_w[ply_i[:, None], raw_ptm].astype(np.int32).sum(axis=1, dtype=np.int32)
+
+    blk = (ply_i & 1) if model.num_blocks == 2 else PLY_TO_EO30_BLK[ply_i]
+    key_ptm = raw_ptm[:, :14]
+    h = model.h_emb[blk[:, None], key_ptm].astype(np.int32)  # [N, 14, emb_ch]
+    g_sum = h.sum(axis=1, dtype=np.int32)                    # [N, emb_ch]
+
+    if model.emb_ch == 8:
+        ug = np.clip(g_sum + model.mu_g[ply_i, :8].astype(np.int32), 0, SCRELU_Q).astype(np.int32)
+        terms = np.concatenate([ug * ug, ug[:, :4] * ug[:, 4:]], axis=1)  # [N, 12]
+        sc_acc = (model.beta_g[ply_i, :12].astype(np.int32) * terms).sum(axis=1, dtype=np.int32)
+    else:
+        ug = np.clip(g_sum + model.mu_g[ply_i, :4].astype(np.int32), 0, SCRELU_Q).astype(np.int32)
+        terms = np.concatenate(
+            [ug * ug, (ug[:, 0] * ug[:, 2])[:, None], (ug[:, 1] * ug[:, 3])[:, None]],
+            axis=1,
+        )  # [N, 6]
+        sc_acc = (model.beta_g[ply_i, :6].astype(np.int32) * terms).sum(axis=1, dtype=np.int32)
+
+    if model.local_relu:
+        h4 = h[:, :, :4]
+        mu_e = model.mu_e[ply_i].astype(np.int32)
+        sum_y0 = np.zeros((n, 4), dtype=np.int32)
+        for r in range(4):
+            c1 = (r + 1) & 3
+            sum_y0 += np.maximum(0, h4[:, 4 + r] + h4[:, 8 + r] + h4[:, r] + h4[:, c1] + mu_e).astype(np.int32)
+        mu_d = model.mu_d[ply_i].astype(np.int32)
+        sum_y1 = np.zeros((n, 4), dtype=np.int32)
+        for d in range(2):
+            sum_y1 += np.maximum(0, h4[:, 12 + d] + h4[:, d] + h4[:, d + 2] + mu_d).astype(np.int32)
+        sc_acc = (
+            sc_acc
+            + (model.beta_e[ply_i].astype(np.int32) * (sum_y0 << np.int32(4))).sum(axis=1, dtype=np.int32)
+            + (model.beta_d[ply_i].astype(np.int32) * (sum_y1 << np.int32(4))).sum(axis=1, dtype=np.int32)
+        ).astype(np.int32)
+
+    res = np.clip(
+        _sym_rshift_i32(sc_acc, SCRELU_SHIFT) + model.b_ply[ply_i].astype(np.int32),
+        -WACA_MAX_RES,
+        WACA_MAX_RES,
+    ).astype(np.int32)
+    return (v1 + res).astype(np.int32)

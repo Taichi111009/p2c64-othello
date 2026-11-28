@@ -50,9 +50,17 @@ targets = [
     ("WACA_V33 MLP Kernel",   r"<(?:int )?p2c64::eval_waca_v33_mlp_kernel\([^>]*>:\n(.*?)(?:\n\n|\Z)", 40, True),
     ("WACA_V33 Stage3 [B]",   r"<int p2c64::eval_waca_v33_stage3_ptm<false>\([^>]*>:\n(.*?)(?:\n\n|\Z)", 120, "v33_internal"),
     ("WACA_V33 Stage3 [W]",   r"<int p2c64::eval_waca_v33_stage3_ptm<true>\([^>]*>:\n(.*?)(?:\n\n|\Z)",  120, "v33_internal"),
+    ("SWAR_V40 4c/G [B]",     r"<int p2c64::eval_swar_v40_ptm<false, false, false>\([^>]*>:\n(.*?)(?:\n\n|\Z)", 14, True),
+    ("SWAR_V40 4c/G [W]",     r"<int p2c64::eval_swar_v40_ptm<true, false, false>\([^>]*>:\n(.*?)(?:\n\n|\Z)",  14, True),
+    ("SWAR_V40 4c/L [B]",     r"<int p2c64::eval_swar_v40_ptm<false, false, true>\([^>]*>:\n(.*?)(?:\n\n|\Z)",  24, True),
+    ("SWAR_V40 4c/L [W]",     r"<int p2c64::eval_swar_v40_ptm<true, false, true>\([^>]*>:\n(.*?)(?:\n\n|\Z)",   24, True),
+    ("SWAR_V40 8c/G [B]",     r"<int p2c64::eval_swar_v40_ptm<false, true, false>\([^>]*>:\n(.*?)(?:\n\n|\Z)",  26, True),
+    ("SWAR_V40 8c/G [W]",     r"<int p2c64::eval_swar_v40_ptm<true, true, false>\([^>]*>:\n(.*?)(?:\n\n|\Z)",   26, True),
+    ("SWAR_V40 8c/L [B]",     r"<int p2c64::eval_swar_v40_ptm<false, true, true>\([^>]*>:\n(.*?)(?:\n\n|\Z)",   36, True),
+    ("SWAR_V40 8c/L [W]",     r"<int p2c64::eval_swar_v40_ptm<true, true, true>\([^>]*>:\n(.*?)(?:\n\n|\Z)",    36, True),
 ]
 
-print("=== P2C-64 v3.4 Pure-Scalar Assembly Audit (objdump -d -C, Black [B] & White [W]) ===")
+print("=== P2C-64 v4.0 Pure-Scalar Assembly Audit (objdump -d -C, Black [B] & White [W]) ===")
 print(f"{'Kernel':<22} | {'Insns':>6} | {'imul':>5} | {'div':>4} | {'calls':>5} | {'plt':>4} | {'xmm/ymm/zmm':>11} | Status")
 print("-" * 89)
 
@@ -83,6 +91,9 @@ for item in targets:
     if avx > 0 or simd > 0:
         status = f"FAIL (expected 0 simd, got {simd})"
         failed = True
+    elif divs > 0:
+        status = f"FAIL (expected 0 div, got {divs})"
+        failed = True
     elif pop_plt > 0 or plt_calls > 0:
         status = f"FAIL (expected 0 PLT/popcnt calls, got plt={plt_calls} pop={pop_plt})"
         failed = True
@@ -102,5 +113,5 @@ for item in targets:
 
 if failed:
     sys.exit(1)
-print(f"\n[PASS] Assembly audit verified: 0 SIMD/AVX & 0 PLT calls across all {len(targets)} v2.0 + v3.0 + v3.1 + v3.2 + v3.3/v3.4 kernels!")
+print(f"\n[PASS] Assembly audit verified: 0 SIMD/AVX, 0 div & 0 PLT calls across all {len(targets)} v2.0 + v3.0 + v3.1 + v3.2 + v3.3/v3.4 + v4.0 kernels!")
 PYEOF

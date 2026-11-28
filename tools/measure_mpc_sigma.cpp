@@ -63,7 +63,9 @@ static void print_usage(const char* prog) {
     std::printf("  --tt-guard <d>         WIDE_SAFE_BND TT safety margin (default: 4.5)\n");
     std::printf("  --gate-mode <m>        safe_bnd|fail_hard|full|wide_safe_bnd (default: safe_bnd)\n");
     std::printf("  --csv <path>           Write MPC sigma comparison CSV\n");
-    std::printf("  --calibrate-out <path> Auto-calibrate all 4 pairs (1,5)..(4,8) x 6 ply buckets to CSV\n");
+    std::printf("  --calibrate-out <path> Auto-calibrate MPC pairs x 6 ply buckets to CSV\n");
+    std::printf("  --max-cal-depth <d>    Max deep depth for d-4 calibration: 8|9|10 (default: 8)\n");
+    std::printf("  --cal-eg-d2            Calibrate all 8 Egaroucid parity-matched d/2 pairs (1,3)..(4,10)\n");
 }
 
 static std::string make_cal_path(const std::string& base, const char* mode_name, size_t total_models) {
@@ -81,6 +83,8 @@ int main(int argc, char** argv) {
     size_t num_pos    = 2000;
     int d_shallow     = 2;
     int d_deep        = 6;
+    int max_cal_depth = 8;
+    bool cal_eg_d2    = false;
     size_t tt_mb      = 64;
     double m25_d      = 2.5;
     double m3_d       = 1.5;
@@ -92,6 +96,8 @@ int main(int argc, char** argv) {
         else if (arg == "--num-pos" && i + 1 < argc)       num_pos = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
         else if (arg == "--shallow" && i + 1 < argc)       d_shallow = std::atoi(argv[++i]);
         else if (arg == "--deep" && i + 1 < argc)          d_deep = std::atoi(argv[++i]);
+        else if (arg == "--max-cal-depth" && i + 1 < argc) max_cal_depth = std::atoi(argv[++i]);
+        else if (arg == "--cal-eg-d2")                     cal_eg_d2 = true;
         else if (arg == "--tt-mb" && i + 1 < argc)         tt_mb = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
         else if (arg == "--m25" && i + 1 < argc)           m25_d = std::atof(argv[++i]);
         else if (arg == "--m3" && i + 1 < argc)            m3_d = std::atof(argv[++i]);
@@ -110,6 +116,10 @@ int main(int argc, char** argv) {
     if (data_path.empty() || model_paths.empty()) {
         std::fprintf(stderr, "ERROR: --data and --models are required.\n");
         print_usage(argv[0]);
+        return 1;
+    }
+    if (max_cal_depth < 8 || max_cal_depth > 10) {
+        std::fprintf(stderr, "ERROR: --max-cal-depth must be 8, 9, or 10.\n");
         return 1;
     }
 
@@ -140,16 +150,30 @@ int main(int argc, char** argv) {
     }
 
     // ------------------------------------------------------------------------
-    // Mode A: Full 4-pair (1,5)..(4,8) x 6-ply-bucket Buro MPC Auto-Calibration
+    // Mode A: Full Multi-Pair x 6-Ply-Bucket Buro MPC Auto-Calibration
+    //   - Default: d-4 pairs (1,5)..(max_cal_depth-4, max_cal_depth) [4..6 pairs]
+    //   - --cal-eg-d2: all 8 Egaroucid parity-matched pairs (1,3)..(4,10)
     // ------------------------------------------------------------------------
     if (!calibrate_out.empty()) {
-        static constexpr int PAIRS[4][2]   = {{1, 5}, {2, 6}, {3, 7}, {4, 8}};
+        std::vector<std::pair<int, int>> pairs;
+        if (cal_eg_d2) {
+            pairs = {{1, 3}, {2, 4}, {3, 5}, {2, 6}, {3, 7}, {4, 8}, {5, 9}, {4, 10}};
+        } else {
+            for (int dd = 5; dd <= max_cal_depth; ++dd) {
+                pairs.emplace_back(dd - 4, dd);
+            }
+        }
+        int max_needed_depth = 0;
+        for (const auto& pr : pairs) max_needed_depth = std::max(max_needed_depth, pr.second);
+        const size_t n_pairs = pairs.size();
+
         static constexpr int BKT_LO[6]     = { 0, 10, 20, 30, 40, 50};
         static constexpr int BKT_HI[6]     = { 9, 19, 29, 39, 49, 59};
         static constexpr int BKT_CENTER[6] = { 5, 15, 25, 35, 45, 54};
         static constexpr size_t MIN_BKT_N  = 25;
 
-        std::printf("=== P2C-64 v3.4 Multi-ProbCut Auto-Calibrator (4 pairs x 6 ply buckets) ===\n");
+        std::printf("=== P2C-64 v4.0 Multi-ProbCut Auto-Calibrator (%zu pairs x 6 ply buckets, mode=%s) ===\n",
+                    n_pairs, cal_eg_d2 ? "eg_d2" : "d-4");
         std::printf("Dataset : %s (%zu sampled positions out of %zu)\n", data_path.c_str(), samples.size(), total_rec);
         std::printf("Gate    : %s (m25=%.2f, m3=%.2f, tt_guard=%.2f)\n", gate_mode_str.c_str(), m25_d, m3_d, tt_guard_d);
 
@@ -164,17 +188,17 @@ int main(int argc, char** argv) {
             eng.set_waca_gate(gm, m25_d, m3_d, tt_guard_d);
             const double inv_scale = 1.0 / static_cast<double>(m.score_scale);
 
-            std::vector<double> ax[4], ay[4];
-            std::vector<double> bx[4][6], by[4][6];
+            std::vector<std::vector<double>> ax(n_pairs), ay(n_pairs);
+            std::vector<std::array<std::vector<double>, 6>> bx(n_pairs), by(n_pairs);
 
             for (const auto& s : samples) {
                 if (s.ply > 59) continue;
                 const int empties = 60 - static_cast<int>(s.ply);
-                if (empties <= 5) continue;
+                if (empties <= 3) continue;
 
-                double v[9]{};
-                bool valid[9]{};
-                const int max_d = std::min(8, empties - 1);
+                double v[11]{};
+                bool valid[11]{};
+                const int max_d = std::min(max_needed_depth, empties - 1);
                 for (int d = 1; d <= max_d; ++d) {
                     eng.clear_tt();
                     v[d] = static_cast<double>(eng.eval_fixed_depth(s.black, s.white, s.stm, d, false)) * inv_scale;
@@ -182,9 +206,9 @@ int main(int argc, char** argv) {
                 }
 
                 const int bkt = std::min(5, static_cast<int>(s.ply) / 10);
-                for (int pi = 0; pi < 4; ++pi) {
-                    const int dsh = PAIRS[pi][0];
-                    const int ddp = PAIRS[pi][1];
+                for (size_t pi = 0; pi < n_pairs; ++pi) {
+                    const int dsh = pairs[pi].first;
+                    const int ddp = pairs[pi].second;
                     if (valid[dsh] && valid[ddp]) {
                         ax[pi].push_back(v[dsh]);
                         ay[pi].push_back(v[ddp]);
@@ -203,12 +227,12 @@ int main(int argc, char** argv) {
             ofs << "d_shallow,d_deep,ply_lo,ply_hi,ply_center,n,slope,intercept,sigma,r2\n";
 
             std::printf("\n--- Model: %s (%s) -> %s ---\n", eval_mode_name(m.mode), mp.c_str(), out_csv.c_str());
-            std::printf("Pair  | Ply    |    N |  Slope |    Bias |  Sigma |    R^2 | Note\n");
-            std::printf("------+--------+------+--------+---------+--------+--------+---------\n");
+            std::printf("Pair   | Ply    |    N |  Slope |    Bias |  Sigma |    R^2 | Note\n");
+            std::printf("-------+--------+------+--------+---------+--------+--------+---------\n");
 
-            for (int pi = 0; pi < 4; ++pi) {
-                const int dsh = PAIRS[pi][0];
-                const int ddp = PAIRS[pi][1];
+            for (size_t pi = 0; pi < n_pairs; ++pi) {
+                const int dsh = pairs[pi].first;
+                const int ddp = pairs[pi].second;
                 RegStats r_all = fit_linear_regression(ax[pi], ay[pi]);
 
                 RegStats fallback{};
@@ -240,7 +264,7 @@ int main(int argc, char** argv) {
                         << BKT_CENTER[b] << "," << st.n << ","
                         << st.slope << "," << st.intercept << "," << st.sigma << "," << st.r2 << "\n";
 
-                    std::printf("d%d->d%d | %2d..%2d | %4zu | %6.3f | %+7.3f | %6.3f | %6.3f | %s\n",
+                    std::printf("d%d->d%-2d| %2d..%2d | %4zu | %6.3f | %+7.3f | %6.3f | %6.3f | %s\n",
                                 dsh, ddp, BKT_LO[b], BKT_HI[b], st.n,
                                 st.slope, st.intercept, st.sigma, st.r2,
                                 used_fallback ? "fallback" : "fit");

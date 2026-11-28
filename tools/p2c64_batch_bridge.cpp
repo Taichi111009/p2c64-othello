@@ -794,6 +794,51 @@ int32_t waca_g2_v33_eval_file_batch_stages(const char*     p2c_path,
     return model.waca_v33->mlp_hidden;
 }
 
+// ============================================================================
+// 13) Evaluate a .p2c v4.0 SWAR_V40 file + optional 16-symmetry (D4 x Z2) check
+// ============================================================================
+int32_t swar_v40_eval_file_batch(const char*     p2c_path,
+                                 const uint64_t* black,
+                                 const uint64_t* white,
+                                 const int8_t*   stm,
+                                 const uint8_t*  ply,
+                                 int32_t         n,
+                                 int32_t*        out_scores,
+                                 int32_t*        out_max_sym_err) {
+    LoadedModel model;
+    std::string err;
+    if (!load_p2c_model(p2c_path, model, &err) || !model.is_swar_v40) {
+        std::fprintf(stderr, "[p2c64_batch_bridge] load SWAR_V40 failed: %s\n", err.c_str());
+        return -1;
+    }
+    const auto& pt = get_pattern_tables();
+    int32_t max_err = 0;
+
+    for (int32_t i = 0; i < n; ++i) {
+        uint16_t idx[NUM_PATTERNS];
+        pt.extract_indices(black[i], white[i], idx);
+        const int32_t sc = eval_swar_v40(*model.swar_v40, pt.meta, idx,
+                                         static_cast<int>(stm[i]), static_cast<int>(ply[i]));
+        if (out_scores) out_scores[i] = sc;
+
+        if (out_max_sym_err) {
+            for (int sym = 0; sym < 16; ++sym) {
+                uint64_t tb = 0, tw = 0;
+                int tstm = 0;
+                transform_board_d4z2(black[i], white[i], static_cast<int>(stm[i]), sym, tb, tw, tstm);
+                uint16_t tidx[NUM_PATTERNS];
+                pt.extract_indices(tb, tw, tidx);
+                const int32_t tsc = eval_swar_v40(*model.swar_v40, pt.meta, tidx,
+                                                  tstm, static_cast<int>(ply[i]));
+                const int32_t d = abs_i32(tsc - sc);
+                if (d > max_err) max_err = d;
+            }
+        }
+    }
+    if (out_max_sym_err) *out_max_sym_err = max_err;
+    return static_cast<int32_t>(model.mode);
+}
+
 uint64_t p2c64_fnv1a_64(const void* data, size_t len) {
     return fnv1a_64_update(fnv1a_64_init(), data, len);
 }

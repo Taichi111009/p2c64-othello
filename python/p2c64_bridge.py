@@ -144,6 +144,13 @@ class P2C64Bridge:
         ]
         self.lib.waca_g2_v33_eval_file_batch_stages.restype = ctypes.c_int32
 
+        self.lib.swar_v40_eval_file_batch.argtypes = [
+            ctypes.c_char_p,
+            c_u64_p, c_u64_p, c_i8_p, c_u8_p,
+            ctypes.c_int32, c_i32_p, c_i32_p,
+        ]
+        self.lib.swar_v40_eval_file_batch.restype = ctypes.c_int32
+
         self.lib.p2c64_fnv1a_64.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
         self.lib.p2c64_fnv1a_64.restype = ctypes.c_uint64
 
@@ -625,3 +632,35 @@ class P2C64Bridge:
         if h < 0:
             raise RuntimeError(f"C++ waca_g2_v33_eval_file_batch_stages failed on {p2c_path}")
         return int(h), v1, v25, v3, sym3
+
+    def eval_swar_v40_file(
+        self,
+        p2c_path: str | os.PathLike,
+        black: np.ndarray,
+        white: np.ndarray,
+        stm: np.ndarray,
+        ply: np.ndarray,
+        check_16sym: bool = False,
+    ) -> Tuple[int, np.ndarray, int]:
+        black = np.ascontiguousarray(black, dtype=np.uint64)
+        white = np.ascontiguousarray(white, dtype=np.uint64)
+        stm = np.ascontiguousarray(stm, dtype=np.int8)
+        ply = np.ascontiguousarray(ply, dtype=np.uint8)
+        n = int(black.shape[0])
+        scores = np.empty(n, dtype=np.int32)
+        sym_err = ctypes.c_int32(0)
+        c_i32_p = ctypes.POINTER(ctypes.c_int32)
+
+        mode = self.lib.swar_v40_eval_file_batch(
+            os.fsencode(str(p2c_path)),
+            black.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+            white.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+            stm.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
+            ply.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            ctypes.c_int32(n),
+            scores.ctypes.data_as(c_i32_p),
+            ctypes.byref(sym_err) if check_16sym else ctypes.cast(0, c_i32_p),
+        )
+        if mode < 0:
+            raise RuntimeError(f"C++ swar_v40_eval_file_batch failed on {p2c_path}")
+        return int(mode), scores, int(sym_err.value)

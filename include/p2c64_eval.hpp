@@ -52,7 +52,8 @@ enum class EvalMode : int {
     WACA_G2               = 6,
     WACA_G2_V31           = 7,
     WACA_G2_V32           = 8,
-    WACA_G2_V33           = 9
+    WACA_G2_V33           = 9,
+    SWAR_V40              = 10
 };
 
 // ============================================================================
@@ -2786,6 +2787,360 @@ inline int32_t eval_waca_g2_v33_gated(const WacaG2V33Weights& w,
     const int32_t rt = is_w ? eval_waca_v33_stage3_ptm<true>(w, meta, idx, P, O, mvP, mvO, v1, f, r25, ply)
                             : eval_waca_v33_stage3_ptm<false>(w, meta, idx, P, O, mvP, mvO, v1, f, r25, ply);
     return v1 + rt;
+}
+
+// ============================================================================
+// P2C-64 v4.0 (Path A-I): 100%-Leaf On-Demand SWAR-Packed Single-Pass Kernel
+//   - Zero gating, zero incremental make_move state, zero Flood-Fill, 0-SIMD!
+//   - Offset-encoded int16x4 SWAR packing (SWAR_C = 2048): u_k = h_k + 2048 in [1921, 2175]
+//   - Supports emb_ch in {4, 8}, num_blocks in {2, 30}, local_relu in {0, 1}
+//   - Overflow safety: worst-case |sc_acc| <= 963,457,396 << INT32_MAX (2,147,483,647)
+// ============================================================================
+static constexpr int32_t  SWAR_V40_C        = 2048;
+static constexpr uint64_t SWAR_V40_SIGN_XOR = 0x8000800080008000ULL;
+static constexpr int32_t  SWAR_V40_H_MAX    = 127;
+static constexpr int32_t  SWAR_V40_MU_MAX   = 256;
+static constexpr int32_t  SWAR_V40_BETA_MAX = SCRELU_BETA_MAX; // 2047
+
+static inline constexpr uint64_t pack_u16x4_raw(uint16_t a0, uint16_t a1, uint16_t a2, uint16_t a3) noexcept {
+    return static_cast<uint64_t>(a0)
+         | (static_cast<uint64_t>(a1) << 16)
+         | (static_cast<uint64_t>(a2) << 32)
+         | (static_cast<uint64_t>(a3) << 48);
+}
+
+static inline constexpr uint64_t pack_swar_h4(int8_t h0, int8_t h1, int8_t h2, int8_t h3) noexcept {
+    return pack_u16x4_raw(
+        static_cast<uint16_t>(static_cast<int32_t>(h0) + SWAR_V40_C),
+        static_cast<uint16_t>(static_cast<int32_t>(h1) + SWAR_V40_C),
+        static_cast<uint16_t>(static_cast<int32_t>(h2) + SWAR_V40_C),
+        static_cast<uint16_t>(static_cast<int32_t>(h3) + SWAR_V40_C));
+}
+
+static inline constexpr int8_t unpack_swar_h_lane(uint64_t packed, int lane) noexcept {
+    const int32_t u = static_cast<int32_t>((packed >> (lane * 16)) & 0xFFFFU);
+    return static_cast<int8_t>(u - SWAR_V40_C);
+}
+
+// Bit-63-safe branchless 4-lane int16x4 SWAR unbias + ReLU (0 branches, 0 imul, 0 SIMD)
+static inline uint64_t swar_unbias_relu_i16x4(uint64_t acc, uint64_t u_mu) noexcept {
+    const uint64_t x = (acc + u_mu) ^ 0x8000800080008000ULL;
+    const uint64_t s = x & 0x8000800080008000ULL;
+    const uint64_t m = (s - (s >> 15)) | s;
+    return x & ~m;
+}
+
+struct alignas(16) SwarEmb8 {
+    uint64_t lo;
+    uint64_t hi;
+};
+static_assert(sizeof(SwarEmb8) == 16 && alignof(SwarEmb8) == 16, "SwarEmb8 must be 16B aligned");
+
+struct alignas(64) SwarV40HeadPly {
+    // Precomputed SWAR unbias constants (auto-generated on load / prepare)
+    uint64_t u_mu_g_lo = 0; // pack_u16x4((32768 - 14*2048) + mu_g[0..3]) = 4096 + mu_g
+    uint64_t u_mu_g_hi = 0; // pack_u16x4((32768 - 14*2048) + mu_g[4..7]) = 4096 + mu_g
+    uint64_t u_mu_e    = 0; // pack_u16x4((32768 -  4*2048) + mu_e[0..3]) = 24576 + mu_e
+    uint64_t u_mu_d    = 0; // pack_u16x4((32768 -  3*2048) + mu_d[0..3]) = 26624 + mu_d
+
+    // Serializable 76B/ply parameters (4.56 KiB for 60 plies, L1D-resident)
+    int16_t  mu_g[8]{};     // |mu| <= 256
+    int16_t  mu_e[4]{};     // |mu| <= 256
+    int16_t  mu_d[4]{};     // |mu| <= 256
+    int16_t  beta_g[12]{};  // |beta| <= 2047 (4ch: 6 terms, 8ch: 12 terms)
+    int16_t  beta_e[4]{};   // |beta| <= 2047 (local 4-Edge SWAR-ReLU)
+    int16_t  beta_d[4]{};   // |beta| <= 2047 (local 2-Diag SWAR-ReLU)
+    int32_t  b_ply = 0;     // per-ply constant bias (eliminates v3.3 ply-bias gap)
+
+    void prepare_swar_constants() noexcept {
+        auto mk = [](const int16_t* mu, int32_t base_offset) -> uint64_t {
+            return pack_u16x4_raw(
+                static_cast<uint16_t>(base_offset + static_cast<int32_t>(mu[0])),
+                static_cast<uint16_t>(base_offset + static_cast<int32_t>(mu[1])),
+                static_cast<uint16_t>(base_offset + static_cast<int32_t>(mu[2])),
+                static_cast<uint16_t>(base_offset + static_cast<int32_t>(mu[3])));
+        };
+        u_mu_g_lo = mk(mu_g,     32768 - 14 * SWAR_V40_C); // 4096 + mu_g[0..3]
+        u_mu_g_hi = mk(mu_g + 4, 32768 - 14 * SWAR_V40_C); // 4096 + mu_g[4..7]
+        u_mu_e    = mk(mu_e,     32768 -  4 * SWAR_V40_C); // 24576 + mu_e[0..3]
+        u_mu_d    = mk(mu_d,     32768 -  3 * SWAR_V40_C); // 26624 + mu_d[0..3]
+    }
+};
+
+struct SwarV40Weights {
+    int                                emb_ch     = 8;  // 4 or 8
+    int                                num_blocks = 30; // 2 (ply&1) or 30 (PLY_TO_EO30_BLK[ply])
+    int                                local_relu = 0;  // 0 or 1
+    RawNTuple64Weights                 tier1;           // Full 60-ply 64-pattern Tier-1 (46.92 MiB)
+    std::vector<std::vector<uint64_t>> h_swar4;         // [num_blocks][91,854] when emb_ch == 4
+    std::vector<std::vector<SwarEmb8>> h_swar8;         // [num_blocks][91,854] when emb_ch == 8
+    std::array<SwarV40HeadPly, NUM_PLIES> head{};
+
+    SwarV40Weights(int ch = 8, int blocks = 30, int loc = 0) {
+        init(ch, blocks, loc);
+    }
+
+    void init(int ch, int blocks, int loc) {
+        emb_ch     = (ch == 4) ? 4 : 8;
+        num_blocks = (blocks == 2) ? 2 : 30;
+        local_relu = (loc != 0) ? 1 : 0;
+        const auto& pt = get_pattern_tables();
+        const uint64_t zero_packed = pack_swar_h4(0, 0, 0, 0);
+        if (emb_ch == 4) {
+            h_swar8.clear();
+            h_swar4.assign(static_cast<size_t>(num_blocks),
+                           std::vector<uint64_t>(static_cast<size_t>(pt.key_raw_entries), zero_packed));
+        } else {
+            h_swar4.clear();
+            h_swar8.assign(static_cast<size_t>(num_blocks),
+                           std::vector<SwarEmb8>(static_cast<size_t>(pt.key_raw_entries),
+                                                 SwarEmb8{zero_packed, zero_packed}));
+        }
+        for (int ply = 0; ply < NUM_PLIES; ++ply) {
+            head[ply] = SwarV40HeadPly{};
+            head[ply].prepare_swar_constants();
+        }
+    }
+
+    void prepare_all_heads() noexcept {
+        for (int ply = 0; ply < NUM_PLIES; ++ply) {
+            head[ply].prepare_swar_constants();
+        }
+    }
+
+    // Load packed SWAR tables from raw int8_t[num_blocks][91,854][emb_ch] buffer
+    void pack_from_i8(const int8_t* src) {
+        const auto& pt = get_pattern_tables();
+        const size_t n_key = static_cast<size_t>(pt.key_raw_entries);
+        if (emb_ch == 4) {
+            for (int b = 0; b < num_blocks; ++b) {
+                uint64_t* dst = h_swar4[static_cast<size_t>(b)].data();
+                const int8_t* row = src + static_cast<size_t>(b) * n_key * 4;
+                for (size_t i = 0; i < n_key; ++i) {
+                    const int8_t* h = row + i * 4;
+                    dst[i] = pack_swar_h4(h[0], h[1], h[2], h[3]);
+                }
+            }
+        } else {
+            for (int b = 0; b < num_blocks; ++b) {
+                SwarEmb8* dst = h_swar8[static_cast<size_t>(b)].data();
+                const int8_t* row = src + static_cast<size_t>(b) * n_key * 8;
+                for (size_t i = 0; i < n_key; ++i) {
+                    const int8_t* h = row + i * 8;
+                    dst[i].lo = pack_swar_h4(h[0], h[1], h[2], h[3]);
+                    dst[i].hi = pack_swar_h4(h[4], h[5], h[6], h[7]);
+                }
+            }
+        }
+    }
+
+    // Unpack packed SWAR tables back to raw int8_t[num_blocks][91,854][emb_ch] buffer
+    void unpack_to_i8(int8_t* dst) const {
+        const auto& pt = get_pattern_tables();
+        const size_t n_key = static_cast<size_t>(pt.key_raw_entries);
+        if (emb_ch == 4) {
+            for (int b = 0; b < num_blocks; ++b) {
+                const uint64_t* src = h_swar4[static_cast<size_t>(b)].data();
+                int8_t* row = dst + static_cast<size_t>(b) * n_key * 4;
+                for (size_t i = 0; i < n_key; ++i) {
+                    const uint64_t u = src[i];
+                    row[i * 4 + 0] = unpack_swar_h_lane(u, 0);
+                    row[i * 4 + 1] = unpack_swar_h_lane(u, 1);
+                    row[i * 4 + 2] = unpack_swar_h_lane(u, 2);
+                    row[i * 4 + 3] = unpack_swar_h_lane(u, 3);
+                }
+            }
+        } else {
+            for (int b = 0; b < num_blocks; ++b) {
+                const SwarEmb8* src = h_swar8[static_cast<size_t>(b)].data();
+                int8_t* row = dst + static_cast<size_t>(b) * n_key * 8;
+                for (size_t i = 0; i < n_key; ++i) {
+                    const uint64_t lo = src[i].lo;
+                    const uint64_t hi = src[i].hi;
+                    row[i * 8 + 0] = unpack_swar_h_lane(lo, 0);
+                    row[i * 8 + 1] = unpack_swar_h_lane(lo, 1);
+                    row[i * 8 + 2] = unpack_swar_h_lane(lo, 2);
+                    row[i * 8 + 3] = unpack_swar_h_lane(lo, 3);
+                    row[i * 8 + 4] = unpack_swar_h_lane(hi, 0);
+                    row[i * 8 + 5] = unpack_swar_h_lane(hi, 1);
+                    row[i * 8 + 6] = unpack_swar_h_lane(hi, 2);
+                    row[i * 8 + 7] = unpack_swar_h_lane(hi, 3);
+                }
+            }
+        }
+    }
+
+    // D4 internal mirror symmetrization for Tier-1 and SWAR Key-14 embeddings
+    void symmetrize() {
+        tier1.symmetrize();
+        const auto& pt = get_pattern_tables();
+        for (int b = 0; b < num_blocks; ++b) {
+            for (int t = 0; t < 4; ++t) {
+                const int32_t off = pt.type_raw_off[t];
+                const int32_t sz  = pt.type_raw_size[t];
+                const int ng      = pt.type_sym[t].num_gens;
+                if (ng == 0) continue;
+                std::vector<uint8_t> vis(static_cast<size_t>(sz), 0);
+                for (int32_t x = 0; x < sz; ++x) {
+                    if (vis[x]) continue;
+                    std::vector<int32_t> orb;
+                    orb.push_back(x);
+                    vis[x] = 1;
+                    for (size_t qi = 0; qi < orb.size(); ++qi) {
+                        const int32_t cur = orb[qi];
+                        for (int g = 0; g < ng; ++g) {
+                            const int32_t nxt = pt.permute_raw_index(t, g, cur);
+                            if (!vis[nxt]) {
+                                vis[nxt] = 1;
+                                orb.push_back(nxt);
+                            }
+                        }
+                    }
+                    if (emb_ch == 4) {
+                        const uint64_t rep = h_swar4[static_cast<size_t>(b)][static_cast<size_t>(off + x)];
+                        for (int32_t idx : orb) h_swar4[static_cast<size_t>(b)][static_cast<size_t>(off + idx)] = rep;
+                    } else {
+                        const SwarEmb8 rep = h_swar8[static_cast<size_t>(b)][static_cast<size_t>(off + x)];
+                        for (int32_t idx : orb) h_swar8[static_cast<size_t>(b)][static_cast<size_t>(off + idx)] = rep;
+                    }
+                }
+            }
+        }
+        prepare_all_heads();
+    }
+};
+
+// Pure-Scalar 0-SIMD Single-Pass SWAR_V40 Kernel (8 audited instantiations: B/W x 4ch/8ch x local=0/1)
+template<bool IS_WHITE, bool CH8, bool LOCAL>
+__attribute__((noinline, noclone))
+int32_t eval_swar_v40_ptm(const SwarV40Weights& w,
+                          const PatternMeta* __restrict meta,
+                          const uint16_t* __restrict idx,
+                          int ply) noexcept {
+    const int16_t* __restrict wp = w.tier1.w_ply[ply].data();
+    const int blk = (w.num_blocks == 2) ? (ply & 1) : static_cast<int>(PLY_TO_EO30_BLK[ply]);
+    const SwarV40HeadPly& sp = w.head[ply];
+
+    int32_t v1 = 0;
+    uint64_t g_lo = 0ULL;
+    uint64_t g_hi = 0ULL;
+    uint64_t lo_arr[LOCAL ? 14 : 1]{};
+
+    if constexpr (CH8) {
+        const SwarEmb8* __restrict he = w.h_swar8[static_cast<size_t>(blk)].data();
+        #pragma GCC unroll 1
+        for (int p = 0; p < NUM_KEY_PATTERNS; ++p) {
+            const int32_t flat = IS_WHITE ? (meta[p].raw_off_end - idx[p])
+                                          : (meta[p].raw_off + idx[p]);
+            v1 += wp[flat];
+            const SwarEmb8 e = he[flat];
+            g_lo += e.lo;
+            g_hi += e.hi;
+            if constexpr (LOCAL) lo_arr[p] = e.lo;
+        }
+    } else {
+        (void)g_hi;
+        const uint64_t* __restrict he = w.h_swar4[static_cast<size_t>(blk)].data();
+        #pragma GCC unroll 1
+        for (int p = 0; p < NUM_KEY_PATTERNS; ++p) {
+            const int32_t flat = IS_WHITE ? (meta[p].raw_off_end - idx[p])
+                                          : (meta[p].raw_off + idx[p]);
+            v1 += wp[flat];
+            const uint64_t elo = he[flat];
+            g_lo += elo;
+            if constexpr (LOCAL) lo_arr[p] = elo;
+        }
+    }
+    #pragma GCC unroll 1
+    for (int p = NUM_KEY_PATTERNS; p < NUM_PATTERNS; ++p) {
+        const int32_t flat = IS_WHITE ? (meta[p].raw_off_end - idx[p])
+                                      : (meta[p].raw_off + idx[p]);
+        v1 += wp[flat];
+    }
+
+    const uint64_t y_lo = swar_unbias_relu_i16x4(g_lo, sp.u_mu_g_lo);
+    const int32_t u0 = std::min<int32_t>(static_cast<int32_t>(y_lo & 0xFFFFU), SCRELU_Q);
+    const int32_t u1 = std::min<int32_t>(static_cast<int32_t>((y_lo >> 16) & 0xFFFFU), SCRELU_Q);
+    const int32_t u2 = std::min<int32_t>(static_cast<int32_t>((y_lo >> 32) & 0xFFFFU), SCRELU_Q);
+    const int32_t u3 = std::min<int32_t>(static_cast<int32_t>(y_lo >> 48), SCRELU_Q);
+
+    int32_t sc_acc = 0;
+    if constexpr (CH8) {
+        const uint64_t y_hi = swar_unbias_relu_i16x4(g_hi, sp.u_mu_g_hi);
+        const int32_t u4 = std::min<int32_t>(static_cast<int32_t>(y_hi & 0xFFFFU), SCRELU_Q);
+        const int32_t u5 = std::min<int32_t>(static_cast<int32_t>((y_hi >> 16) & 0xFFFFU), SCRELU_Q);
+        const int32_t u6 = std::min<int32_t>(static_cast<int32_t>((y_hi >> 32) & 0xFFFFU), SCRELU_Q);
+        const int32_t u7 = std::min<int32_t>(static_cast<int32_t>(y_hi >> 48), SCRELU_Q);
+
+        sc_acc = static_cast<int32_t>(sp.beta_g[0])  * (u0 * u0)
+               + static_cast<int32_t>(sp.beta_g[1])  * (u1 * u1)
+               + static_cast<int32_t>(sp.beta_g[2])  * (u2 * u2)
+               + static_cast<int32_t>(sp.beta_g[3])  * (u3 * u3)
+               + static_cast<int32_t>(sp.beta_g[4])  * (u4 * u4)
+               + static_cast<int32_t>(sp.beta_g[5])  * (u5 * u5)
+               + static_cast<int32_t>(sp.beta_g[6])  * (u6 * u6)
+               + static_cast<int32_t>(sp.beta_g[7])  * (u7 * u7)
+               + static_cast<int32_t>(sp.beta_g[8])  * (u0 * u4)
+               + static_cast<int32_t>(sp.beta_g[9])  * (u1 * u5)
+               + static_cast<int32_t>(sp.beta_g[10]) * (u2 * u6)
+               + static_cast<int32_t>(sp.beta_g[11]) * (u3 * u7);
+    } else {
+        sc_acc = static_cast<int32_t>(sp.beta_g[0]) * (u0 * u0)
+               + static_cast<int32_t>(sp.beta_g[1]) * (u1 * u1)
+               + static_cast<int32_t>(sp.beta_g[2]) * (u2 * u2)
+               + static_cast<int32_t>(sp.beta_g[3]) * (u3 * u3)
+               + static_cast<int32_t>(sp.beta_g[4]) * (u0 * u2)
+               + static_cast<int32_t>(sp.beta_g[5]) * (u1 * u3);
+    }
+
+    if constexpr (LOCAL) {
+        uint64_t sum_y0 = 0ULL;
+        sum_y0 += swar_unbias_relu_i16x4(lo_arr[4] + lo_arr[8]  + lo_arr[0] + lo_arr[1], sp.u_mu_e);
+        sum_y0 += swar_unbias_relu_i16x4(lo_arr[5] + lo_arr[9]  + lo_arr[1] + lo_arr[2], sp.u_mu_e);
+        sum_y0 += swar_unbias_relu_i16x4(lo_arr[6] + lo_arr[10] + lo_arr[2] + lo_arr[3], sp.u_mu_e);
+        sum_y0 += swar_unbias_relu_i16x4(lo_arr[7] + lo_arr[11] + lo_arr[3] + lo_arr[0], sp.u_mu_e);
+
+        uint64_t sum_y1 = 0ULL;
+        sum_y1 += swar_unbias_relu_i16x4(lo_arr[12] + lo_arr[0] + lo_arr[2], sp.u_mu_d);
+        sum_y1 += swar_unbias_relu_i16x4(lo_arr[13] + lo_arr[1] + lo_arr[3], sp.u_mu_d);
+
+        sc_acc += static_cast<int32_t>(sp.beta_e[0]) * (static_cast<int32_t>(sum_y0 & 0xFFFFU) << 4)
+                + static_cast<int32_t>(sp.beta_e[1]) * (static_cast<int32_t>((sum_y0 >> 16) & 0xFFFFU) << 4)
+                + static_cast<int32_t>(sp.beta_e[2]) * (static_cast<int32_t>((sum_y0 >> 32) & 0xFFFFU) << 4)
+                + static_cast<int32_t>(sp.beta_e[3]) * (static_cast<int32_t>(sum_y0 >> 48) << 4)
+                + static_cast<int32_t>(sp.beta_d[0]) * (static_cast<int32_t>(sum_y1 & 0xFFFFU) << 4)
+                + static_cast<int32_t>(sp.beta_d[1]) * (static_cast<int32_t>((sum_y1 >> 16) & 0xFFFFU) << 4)
+                + static_cast<int32_t>(sp.beta_d[2]) * (static_cast<int32_t>((sum_y1 >> 32) & 0xFFFFU) << 4)
+                + static_cast<int32_t>(sp.beta_d[3]) * (static_cast<int32_t>(sum_y1 >> 48) << 4);
+    } else {
+        (void)lo_arr;
+    }
+
+    return v1 + std::clamp<int32_t>(sym_rshift(sc_acc, SCRELU_SHIFT) + sp.b_ply, -WACA_MAX_RES, WACA_MAX_RES);
+}
+
+inline int32_t eval_swar_v40(const SwarV40Weights& w,
+                             const PatternMeta* __restrict meta,
+                             const uint16_t* __restrict idx,
+                             int stm, int ply) noexcept {
+    const bool is_w = (stm < 0);
+    if (w.emb_ch == 8) {
+        if (w.local_relu) {
+            return is_w ? eval_swar_v40_ptm<true,  true,  true>(w, meta, idx, ply)
+                        : eval_swar_v40_ptm<false, true,  true>(w, meta, idx, ply);
+        } else {
+            return is_w ? eval_swar_v40_ptm<true,  true,  false>(w, meta, idx, ply)
+                        : eval_swar_v40_ptm<false, true,  false>(w, meta, idx, ply);
+        }
+    } else {
+        if (w.local_relu) {
+            return is_w ? eval_swar_v40_ptm<true,  false, true>(w, meta, idx, ply)
+                        : eval_swar_v40_ptm<false, false, true>(w, meta, idx, ply);
+        } else {
+            return is_w ? eval_swar_v40_ptm<true,  false, false>(w, meta, idx, ply)
+                        : eval_swar_v40_ptm<false, false, false>(w, meta, idx, ply);
+        }
+    }
 }
 
 } // namespace p2c64

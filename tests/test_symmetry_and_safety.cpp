@@ -1255,8 +1255,289 @@ static void test_v34_mpc_calibration() {
     std::printf("[PASS] Test 15: v3.4 MpcCalTable CSV Load, [0.85..1.15]/[0.80..6.00] Clamping, Piecewise-Linear Interp & Buro Thresholds\n");
 }
 
+static void test_swar_v40_16sym(const std::vector<TestPos>& positions,
+                                int emb_ch, int num_blocks, int local_relu, uint64_t seed) {
+    const PatternTables& pt = get_pattern_tables();
+    Rng rng(seed);
+    SwarV40Weights sw(emb_ch, num_blocks, local_relu);
+    for (int ply = 0; ply < NUM_PLIES; ++ply) {
+        for (int16_t& v : sw.tier1.w_ply[ply]) v = static_cast<int16_t>(rng.range(-400, 400));
+        for (int k = 0; k < 8; ++k) sw.head[ply].mu_g[k] = static_cast<int16_t>(rng.range(-SWAR_V40_MU_MAX, SWAR_V40_MU_MAX));
+        for (int k = 0; k < 4; ++k) {
+            sw.head[ply].mu_e[k]   = static_cast<int16_t>(rng.range(-SWAR_V40_MU_MAX, SWAR_V40_MU_MAX));
+            sw.head[ply].mu_d[k]   = static_cast<int16_t>(rng.range(-SWAR_V40_MU_MAX, SWAR_V40_MU_MAX));
+            sw.head[ply].beta_e[k] = static_cast<int16_t>(rng.range(-120, 120));
+            sw.head[ply].beta_d[k] = static_cast<int16_t>(rng.range(-120, 120));
+        }
+        for (int m = 0; m < 12; ++m) sw.head[ply].beta_g[m] = static_cast<int16_t>(rng.range(-200, 200));
+        sw.head[ply].b_ply = rng.range(-256, 256);
+    }
+    const size_t n_key = static_cast<size_t>(pt.key_raw_entries);
+    std::vector<int8_t> hbuf(static_cast<size_t>(num_blocks) * n_key * static_cast<size_t>(emb_ch));
+    for (int8_t& v : hbuf) v = static_cast<int8_t>(rng.range(-SWAR_V40_H_MAX, SWAR_V40_H_MAX));
+    sw.pack_from_i8(hbuf.data());
+    sw.symmetrize();
+
+    // Roundtrip save/load check
+    const std::string tmp_path = "/tmp/p2c64_test_swar_v40_" + std::to_string(emb_ch) + "_"
+                               + std::to_string(num_blocks) + "_" + std::to_string(local_relu) + ".p2c";
+    if (!save_swar_v40(tmp_path, sw, 128.0f, 1U)) {
+        std::fprintf(stderr, "FAIL: save_swar_v40 failed for %s\n", tmp_path.c_str());
+        std::exit(1);
+    }
+    LoadedModel loaded;
+    std::string err;
+    if (!load_p2c_model(tmp_path, loaded, &err) || !loaded.is_swar_v40) {
+        std::fprintf(stderr, "FAIL: load_p2c_model(SWAR_V40) failed: %s\n", err.c_str());
+        std::exit(1);
+    }
+
+    int32_t max_sym_err = 0;
+    int32_t max_rt_err  = 0;
+    for (const auto& pos : positions) {
+        uint16_t idx[NUM_PATTERNS];
+        pt.extract_indices(pos.black, pos.white, idx);
+        const int32_t base = eval_swar_v40(sw, pt.meta, idx, pos.stm, pos.ply);
+        const int32_t rt   = loaded.evaluate(pt.meta, idx, pos.stm, pos.ply);
+        max_rt_err = std::max(max_rt_err, abs_i32(rt - base));
+        for (int sym = 0; sym < 16; ++sym) {
+            uint64_t tb = 0, tw = 0;
+            int tstm = 0;
+            transform_board_d4z2(pos.black, pos.white, pos.stm, sym, tb, tw, tstm);
+            uint16_t tidx[NUM_PATTERNS];
+            pt.extract_indices(tb, tw, tidx);
+            const int32_t tv = eval_swar_v40(sw, pt.meta, tidx, tstm, pos.ply);
+            max_sym_err = std::max(max_sym_err, abs_i32(tv - base));
+        }
+    }
+    std::remove(tmp_path.c_str());
+
+    if (max_sym_err != 0 || max_rt_err != 0) {
+        std::fprintf(stderr, "FAIL: SWAR_V40(%dch,%dblk,loc=%d) sym_err=%d rt_err=%d\n",
+                     emb_ch, num_blocks, local_relu, max_sym_err, max_rt_err);
+        std::exit(1);
+    }
+    std::printf("[PASS] Test 16: SWAR_V40(%dch,%2dblk,loc=%d) 16-Symmetry (%zu pos x 16 = %zu evals) + .p2c v4.0 Roundtrip | max_err=0\n",
+                emb_ch, num_blocks, local_relu, positions.size(), positions.size() * 16);
+}
+
+static void test_swar_v40_bit63_and_overflow_safety() {
+    // 1) Exhaustive bit-63 and lane-isolation boundary checks for swar_unbias_relu_i16x4
+    const int32_t vals[] = {-2034, -1778, -512, -256, -1, 0, 1, 127, 256, 512, 1778, 2034};
+    for (int32_t v0 : vals) {
+        for (int32_t v3 : vals) {
+            // Test all 4 lanes with mixed signs including lane 3 (bit 63!)
+            const int32_t v1 = -v0;
+            const int32_t v2 = (v3 == 0) ? -1 : -v3;
+            const uint64_t acc = pack_u16x4_raw(
+                static_cast<uint16_t>(14 * SWAR_V40_C + v0),
+                static_cast<uint16_t>(14 * SWAR_V40_C + v1),
+                static_cast<uint16_t>(14 * SWAR_V40_C + v2),
+                static_cast<uint16_t>(14 * SWAR_V40_C + v3));
+            const uint64_t u_mu = pack_u16x4_raw(4096, 4096, 4096, 4096);
+            const uint64_t y = swar_unbias_relu_i16x4(acc, u_mu);
+            const int32_t e0 = std::max(0, v0), e1 = std::max(0, v1), e2 = std::max(0, v2), e3 = std::max(0, v3);
+            const int32_t g0 = static_cast<int32_t>(y & 0xFFFFU);
+            const int32_t g1 = static_cast<int32_t>((y >> 16) & 0xFFFFU);
+            const int32_t g2 = static_cast<int32_t>((y >> 32) & 0xFFFFU);
+            const int32_t g3 = static_cast<int32_t>(y >> 48);
+            if (g0 != e0 || g1 != e1 || g2 != e2 || g3 != e3) {
+                std::fprintf(stderr, "FAIL: swar_unbias_relu_i16x4 mismatch (%d,%d,%d,%d) got=(%d,%d,%d,%d)\n",
+                             v0, v1, v2, v3, g0, g1, g2, g3);
+                std::exit(1);
+            }
+        }
+    }
+
+    // 2) Extreme int32_t == int64_t overflow safety across all (emb_ch, local_relu) x signs
+    const PatternTables& pt = get_pattern_tables();
+    const uint64_t B = (1ULL << rc(3, 4)) | (1ULL << rc(4, 3));
+    const uint64_t W = (1ULL << rc(3, 3)) | (1ULL << rc(4, 4));
+    uint16_t idx[NUM_PATTERNS];
+    pt.extract_indices(B, W, idx);
+
+    for (int emb_ch : {4, 8}) {
+        for (int loc : {0, 1}) {
+            SwarV40Weights sw(emb_ch, 30, loc);
+            for (int sgn : {-1, +1}) {
+                const int8_t hval = static_cast<int8_t>(SWAR_V40_H_MAX); // +127 maximizes all ReLUs
+                const size_t n_key = static_cast<size_t>(pt.key_raw_entries);
+                std::vector<int8_t> hbuf(30 * n_key * static_cast<size_t>(emb_ch), hval);
+                sw.pack_from_i8(hbuf.data());
+                const int ply = 30;
+                for (int k = 0; k < 8; ++k) sw.head[ply].mu_g[k] = SWAR_V40_MU_MAX;
+                for (int k = 0; k < 4; ++k) {
+                    sw.head[ply].mu_e[k]   = SWAR_V40_MU_MAX;
+                    sw.head[ply].mu_d[k]   = SWAR_V40_MU_MAX;
+                    sw.head[ply].beta_e[k] = static_cast<int16_t>(sgn * SWAR_V40_BETA_MAX);
+                    sw.head[ply].beta_d[k] = static_cast<int16_t>(sgn * SWAR_V40_BETA_MAX);
+                }
+                for (int m = 0; m < 12; ++m) sw.head[ply].beta_g[m] = static_cast<int16_t>(sgn * SWAR_V40_BETA_MAX);
+                sw.head[ply].b_ply = sgn * 1024;
+                sw.prepare_all_heads();
+
+                // Exact int64_t reference calculation
+                int64_t sc64 = 0;
+                const int n_g_terms = (emb_ch == 8) ? 12 : 6;
+                sc64 += static_cast<int64_t>(n_g_terms) * (sgn * SWAR_V40_BETA_MAX) * (127LL * 127LL);
+                if (loc) {
+                    const int64_t sum_y0 = 4LL * (4LL * 127LL + 256LL); // 3056
+                    const int64_t sum_y1 = 2LL * (3LL * 127LL + 256LL); // 1274
+                    sc64 += 4LL * (sgn * SWAR_V40_BETA_MAX) * (sum_y0 << 4);
+                    sc64 += 4LL * (sgn * SWAR_V40_BETA_MAX) * (sum_y1 << 4);
+                }
+                if (std::llabs(sc64) > 963457396LL) {
+                    std::fprintf(stderr, "FAIL: SWAR_V40 sc64 exceeded proven bound: %lld\n", static_cast<long long>(sc64));
+                    std::exit(1);
+                }
+                const int64_t r64 = (sc64 >= 0) ? (sc64 / (1LL << SCRELU_SHIFT)) : -((-sc64) / (1LL << SCRELU_SHIFT));
+                const int64_t exp = std::clamp<int64_t>(r64 + sw.head[ply].b_ply, -WACA_MAX_RES, WACA_MAX_RES);
+
+                for (int stm : {+1, -1}) {
+                    const int32_t got = eval_swar_v40(sw, pt.meta, idx, stm, ply);
+                    if (static_cast<int64_t>(got) != exp) {
+                        std::fprintf(stderr, "FAIL: SWAR_V40 overflow mismatch ch=%d loc=%d sgn=%d stm=%d got=%d exp=%lld\n",
+                                     emb_ch, loc, sgn, stm, got, static_cast<long long>(exp));
+                        std::exit(1);
+                    }
+                }
+            }
+        }
+    }
+    std::printf("[PASS] Test 17: SWAR_V40 Bit-63 Boundary & Extreme int32_t == int64_t Overflow Safety (worst |sc_acc|=963,457,396 << INT32_MAX)\n");
+}
+
+static void test_v40_mpc_cal_6pair_and_eg_d2() {
+    LoadedModel model;
+    model.mode        = EvalMode::RAW_NTUPLE_64;
+    model.is_raw      = true;
+    model.score_scale = 128.0f;
+    PVSEngine eng(&model, 1, 10);
+
+    auto near_f = [](float a, double b) -> bool {
+        return std::fabs(static_cast<double>(a) - b) < 1e-2;
+    };
+
+    // 1) Legacy 4-pair CSV -> verifies d5->d9 (0.90x) and d6->d10 (0.85x) safe extrapolation
+    const std::string csv4 = "/tmp/p2c64_test_mpc_cal4_v40.csv";
+    {
+        std::ofstream ofs(csv4, std::ios::trunc);
+        ofs << "d_shallow,d_deep,ply_lo,ply_hi,ply_center,n,slope,intercept,sigma,r2\n";
+        for (int d_sh = 1; d_sh <= 4; ++d_sh) {
+            ofs << d_sh << "," << (d_sh + 4) << ",0,59,30,100,1.00,0.10,2.00,0.95\n";
+        }
+    }
+    std::string err;
+    if (!eng.load_mpc_calibration(csv4, &err) || !eng.mpc_cal_.d4_loaded || eng.mpc_cal_.eg_d2_loaded) {
+        std::fprintf(stderr, "FAIL: 4-pair CSV load failed: %s\n", err.c_str());
+        std::exit(1);
+    }
+    if (!near_f(eng.mpc_cal_.table[3][30].sigma_units, 2.00 * 128.0) ||
+        !near_f(eng.mpc_cal_.table[4][30].sigma_units, 1.80 * 128.0) ||
+        !near_f(eng.mpc_cal_.table[5][30].sigma_units, 1.70 * 128.0)) {
+        std::fprintf(stderr, "FAIL: 4-pair CSV d5/d6 extrapolation mismatch: d4=%.2f d5=%.2f d6=%.2f\n",
+                     eng.mpc_cal_.table[3][30].sigma_units,
+                     eng.mpc_cal_.table[4][30].sigma_units,
+                     eng.mpc_cal_.table[5][30].sigma_units);
+        std::exit(1);
+    }
+    std::remove(csv4.c_str());
+
+    // 2) Full 6-pair CSV -> verifies direct d5->d9 and d6->d10 loading
+    const std::string csv6 = "/tmp/p2c64_test_mpc_cal6_v40.csv";
+    {
+        std::ofstream ofs(csv6, std::ios::trunc);
+        ofs << "d_shallow,d_deep,ply_lo,ply_hi,ply_center,n,slope,intercept,sigma,r2\n";
+        for (int d_sh = 1; d_sh <= 6; ++d_sh) {
+            ofs << d_sh << "," << (d_sh + 4) << ",0,59,30,100,1.00,0.00," << (3.0 - 0.25 * d_sh) << ",0.95\n";
+        }
+    }
+    if (!eng.load_mpc_calibration(csv6, &err) || !eng.mpc_cal_.d4_loaded) {
+        std::fprintf(stderr, "FAIL: 6-pair CSV load failed: %s\n", err.c_str());
+        std::exit(1);
+    }
+    if (!near_f(eng.mpc_cal_.table[4][30].sigma_units, 1.75 * 128.0) ||
+        !near_f(eng.mpc_cal_.table[5][30].sigma_units, 1.50 * 128.0)) {
+        std::fprintf(stderr, "FAIL: 6-pair direct load mismatch\n");
+        std::exit(1);
+    }
+    std::remove(csv6.c_str());
+
+    // 3) Full 8-pair eg_d2 CSV -> verifies pair_table[0..7] for d_deep=3..10
+    const std::string csveg = "/tmp/p2c64_test_mpc_egd2_v40.csv";
+    {
+        std::ofstream ofs(csveg, std::ios::trunc);
+        ofs << "d_shallow,d_deep,ply_lo,ply_hi,ply_center,n,slope,intercept,sigma,r2\n";
+        const int eg_pairs[8][2] = {{1,3},{2,4},{3,5},{2,6},{3,7},{4,8},{5,9},{4,10}};
+        for (int i = 0; i < 8; ++i) {
+            ofs << eg_pairs[i][0] << "," << eg_pairs[i][1] << ",0,59,30,100,1.00,0.05,"
+                << (1.20 + 0.15 * i) << ",0.94\n";
+        }
+    }
+    if (!eng.load_mpc_calibration(csveg, &err) || !eng.mpc_cal_.eg_d2_loaded) {
+        std::fprintf(stderr, "FAIL: eg_d2 CSV load failed: %s\n", err.c_str());
+        std::exit(1);
+    }
+    for (int i = 0; i < 8; ++i) {
+        if (!near_f(eng.mpc_cal_.pair_table[i][30].sigma_units, (1.20 + 0.15 * i) * 128.0)) {
+            std::fprintf(stderr, "FAIL: eg_d2 slot %d mismatch\n", i);
+            std::exit(1);
+        }
+    }
+    std::remove(csveg.c_str());
+
+    std::printf("[PASS] Test 18: v4.0 MpcCalTable 6-Pair (d1..d6 + legacy 0.90x/0.85x extrap) & Egaroucid eg_d2 8-Pair CSV Load\n");
+}
+
+static void test_v40_mg_lmr_and_dyn_t_sanity() {
+    Rng rng(424242ULL);
+    LoadedModel model;
+    model.mode        = EvalMode::SWAR_V40;
+    model.is_swar_v40 = true;
+    model.score_scale = 128.0f;
+    model.swar_v40    = std::make_unique<SwarV40Weights>(8, 30, 0);
+    for (int ply = 0; ply < NUM_PLIES; ++ply) {
+        for (int16_t& v : model.swar_v40->tier1.w_ply[ply]) v = static_cast<int16_t>(rng.range(-64, 64));
+    }
+    model.swar_v40->symmetrize();
+
+    PVSEngine eng(&model, 2, 10);
+    eng.set_mpc(true, 1.50);
+    eng.set_mpc_mode(MpcMode::EG_D2);
+    eng.set_mpc_dyn_t(true);
+    eng.set_mg_lmr(true, 4.0);
+    eng.set_move_order_mode(MoveOrderMode::B4_HYBRID);
+
+    // Run depth-5 search from initial position and midgame positions
+    uint64_t B = (1ULL << rc(3, 4)) | (1ULL << rc(4, 3));
+    uint64_t W = (1ULL << rc(3, 3)) | (1ULL << rc(4, 4));
+    int stm = 1;
+    for (int step = 0; step < 12; ++step) {
+        uint64_t P = (stm > 0) ? B : W;
+        uint64_t O = (stm > 0) ? W : B;
+        uint64_t mv = generate_moves(P, O);
+        if (!mv) { stm = -stm; continue; }
+        SearchResult sr = eng.search(B, W, stm, SearchLimitMode::DEPTH, 5);
+        if (sr.best_move < 0 || ((mv >> sr.best_move) & 1ULL) == 0ULL || sr.completed_depth < 5) {
+            std::fprintf(stderr, "FAIL: D3_mgLMR_m4 + eg_d2 + dyn_t returned invalid move=%d depth=%d\n",
+                         sr.best_move, sr.completed_depth);
+            std::exit(1);
+        }
+        if (sr.s25_runs != 0 || sr.s3_runs != 0) {
+            std::fprintf(stderr, "FAIL: SWAR_V40 should have 0 gated S2.5/S3 runs, got (%llu, %llu)\n",
+                         static_cast<unsigned long long>(sr.s25_runs), static_cast<unsigned long long>(sr.s3_runs));
+            std::exit(1);
+        }
+        uint64_t fl = calc_flips(sr.best_move, P, O);
+        if (stm > 0) { B |= (1ULL << sr.best_move) | fl; W ^= fl; }
+        else         { W |= (1ULL << sr.best_move) | fl; B ^= fl; }
+        stm = -stm;
+    }
+    std::printf("[PASS] Test 19: v4.0 SWAR_V40 + eg_d2 MPC + mpc_dyn_t + D3_mgLMR_m4 Search Sanity (12 plies depth-5, 0 gate runs)\n");
+}
+
 int main() {
-    std::printf("=== P2C-64 v3.4 (Full PTM + WACA-G2 v3.0..v3.3 + Calibrated MPC & Dynamic Gating): Safety & Unit Test Suite ===\n");
+    std::printf("=== P2C-64 v4.0 (Full PTM + WACA-G2 v3.0..v3.3 + SWAR_V40 + Axis C): Safety & Unit Test Suite ===\n");
     auto positions = test_incremental_and_collect_positions();
 
     verify_raw_and_linear_identity(positions);
@@ -1281,6 +1562,14 @@ int main() {
     test_waca_g2_v33_overflow_safety();
     test_v34_dynamic_gating();
     test_v34_mpc_calibration();
+    test_swar_v40_16sym(positions, 4,  2, 0, 12012ULL);
+    test_swar_v40_16sym(positions, 4, 30, 1, 13013ULL);
+    test_swar_v40_16sym(positions, 8,  2, 0, 14014ULL);
+    test_swar_v40_16sym(positions, 8, 30, 0, 15015ULL);
+    test_swar_v40_16sym(positions, 8, 30, 1, 16016ULL);
+    test_swar_v40_bit63_and_overflow_safety();
+    test_v40_mpc_cal_6pair_and_eg_d2();
+    test_v40_mg_lmr_and_dyn_t_sanity();
     std::printf("=== ALL TESTS PASSED (0 ERRORS) ===\n");
     return 0;
 }
